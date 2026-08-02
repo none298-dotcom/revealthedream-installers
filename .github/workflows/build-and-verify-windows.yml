@@ -62,14 +62,6 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # No Android SDK is installed here and none is needed: :desktop is plain Kotlin/JVM.
-      # Verified 2026-08-02 on a checkout with local.properties removed and ANDROID_HOME cleared.
-      # If this starts failing with "SDK location not found", something has made :desktop depend
-      # on an Android module, and that is the real bug.
-      - name: Build the installer
-        working-directory: android
-        run: ./gradlew :desktop:packageExe --console=plain --no-daemon
-
       # The Widgets Board provider. COMPILING IT IS THE ONLY THING THIS RUNNER CAN PROVE.
       #
       # Windows Server has no Widgets Board, on 2022 or 2025, so no runner can ever answer whether
@@ -128,6 +120,71 @@ jobs:
             ForEach-Object { if (-not (Test-Path $_)) { $missing += $_ } }
           if ($missing.Count) { Write-Error "Missing package assets: $($missing -join ', ')"; exit 1 }
           Write-Host "All referenced assets present"
+
+      # PACK THE SPARSE PACKAGE. Only the manifest and the icons go inside; the provider
+      # executable stays outside and is found via -ExternalLocation at registration time. That is
+      # what keeps the 55 MB jpackage bundle out of MSIX entirely.
+      - name: Pack the widget MSIX
+        id: msix
+        shell: pwsh
+        run: |
+          $layout = "$env:RUNNER_TEMP\msix-layout"
+          New-Item -ItemType Directory -Force -Path $layout | Out-Null
+          Copy-Item windows/Package/AppxManifest.xml $layout
+          Copy-Item windows/Package/Assets $layout -Recurse
+
+          $makeappx = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter makeappx.exe -ErrorAction SilentlyContinue |
+                      Where-Object { $_.FullName -match 'x64' } | Select-Object -Last 1
+          if (-not $makeappx) { Write-Error "makeappx.exe not found in the Windows SDK"; exit 1 }
+
+          $out = "$env:RUNNER_TEMP\RevealTheDreamWidgets.msix"
+          & $makeappx.FullName pack /d $layout /p $out /nv /o
+          if ($LASTEXITCODE -ne 0) { Write-Error "makeappx failed"; exit 1 }
+          "msix=$out" >> $env:GITHUB_OUTPUT
+          Write-Host "Packed $([math]::Round((Get-Item $out).Length/1KB,1)) KB"
+
+      # An UNSIGNED sparse package cannot be registered at all: Add-AppxPackage refuses it unless
+      # the machine is in developer mode. Signing it with the same Trusted Signing identity as the
+      # installer is what makes registration work on an ordinary customer machine.
+      - name: Sign the widget MSIX
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
+          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: mlcsigning
+          certificate-profile-name: mlc-public-trust
+          files: ${{ steps.msix.outputs.msix }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Staged BEFORE the installer is built. appResourcesRootDir copies resources/windows/ into the
+      # installed application directory, so the package ships inside the installer and the app can
+      # register it on first launch without a separate download.
+      - name: Stage the MSIX and the provider into the app resources
+        shell: pwsh
+        run: |
+          $res = "android/desktop/resources/windows"
+          New-Item -ItemType Directory -Force -Path $res | Out-Null
+          Copy-Item "${{ steps.msix.outputs.msix }}" "$res/RevealTheDreamWidgets.msix"
+          # The provider executable and its self-contained runtime live NEXT TO the app, which is
+          # exactly what the package's external location points at.
+          Copy-Item "windows/WidgetProvider/bin/x64/Release/net8.0-windows10.0.22621.0/win-x64/*" $res -Recurse -Force
+          Write-Host "Staged $((Get-ChildItem $res -Recurse -File).Count) files"
+
+      # No Android SDK is installed here and none is needed: :desktop is plain Kotlin/JVM.
+      # Verified 2026-08-02 on a checkout with local.properties removed and ANDROID_HOME cleared.
+      # If this starts failing with "SDK location not found", something has made :desktop depend
+      # on an Android module, and that is the real bug.
+      #
+      # RUNS AFTER the staging above, deliberately. jpackage copies the resources directory as it
+      # finds it, so building first would ship an installer with no widget package and nothing
+      # would report the omission.
+      - name: Build the installer
+        working-directory: android
+        run: ./gradlew :desktop:packageExe --console=plain --no-daemon
 
       - name: Find the installer
         id: find
