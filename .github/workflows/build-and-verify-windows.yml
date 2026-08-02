@@ -80,19 +80,27 @@ jobs:
       #
       # It also validates the package manifest, because a malformed AppxManifest fails registration
       # on a customer's machine with an error that reads like a corrupt download.
-      # global.json in that directory pins the SDK to 8.x; see the note in it for why. Installing
-      # it explicitly rather than relying on the image, because the image's default is newer and
-      # global.json would then fail outright instead of falling back.
+      # MSBUILD, NOT `dotnet build`. Windows App SDK's MRT targets call
+      # Microsoft.Build.Packaging.Pri.Tasks.ExpandPriContent, which ships with Visual Studio's Appx
+      # tooling and is NOT in the dotnet SDK at any version. `dotnet build` fails with "the task
+      # could not be loaded", which reads like a broken package reference. It was first mistaken
+      # here for an SDK version problem and pinned to .NET 8; the identical error then appeared on
+      # 8.0.423, which is what ruled the version out.
       - name: .NET 8 for the widget provider
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
+      - name: MSBuild
+        uses: microsoft/setup-msbuild@v2
+
       - name: Compile the widget provider
         shell: pwsh
         working-directory: windows/WidgetProvider
         run: |
-          dotnet build RevealWidgetProvider.csproj -c Release --nologo
+          dotnet restore RevealWidgetProvider.csproj
+          if ($LASTEXITCODE -ne 0) { Write-Error "Restore failed"; exit 1 }
+          msbuild RevealWidgetProvider.csproj /p:Configuration=Release /p:Platform=x64 /v:minimal /nologo
           if ($LASTEXITCODE -ne 0) { Write-Error "Widget provider does not compile"; exit 1 }
 
       - name: Check the package manifest
