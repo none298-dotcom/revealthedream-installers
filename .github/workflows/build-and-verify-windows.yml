@@ -70,6 +70,49 @@ jobs:
         working-directory: android
         run: ./gradlew :desktop:packageExe --console=plain --no-daemon
 
+      # The Widgets Board provider. COMPILING IT IS THE ONLY THING THIS RUNNER CAN PROVE.
+      #
+      # Windows Server has no Widgets Board, on 2022 or 2025, so no runner can ever answer whether
+      # the widget appears. That question needs a human on Windows 11. What this step does catch is
+      # the whole class of failure that got the provider written in the first place: an earlier
+      # draft called two helper methods that do not exist anywhere. A compiler finds that; reading
+      # it again does not.
+      #
+      # It also validates the package manifest, because a malformed AppxManifest fails registration
+      # on a customer's machine with an error that reads like a corrupt download.
+      - name: Compile the widget provider
+        shell: pwsh
+        working-directory: windows/WidgetProvider
+        run: |
+          dotnet build RevealWidgetProvider.csproj -c Release --nologo
+          if ($LASTEXITCODE -ne 0) { Write-Error "Widget provider does not compile"; exit 1 }
+
+      - name: Check the package manifest
+        shell: pwsh
+        working-directory: windows/Package
+        run: |
+          # Well-formedness first, so a broken file fails here rather than inside makeappx.
+          [xml]$m = Get-Content AppxManifest.xml
+          Write-Host "Identity:  $($m.Package.Identity.Name) $($m.Package.Identity.Version)"
+          Write-Host "Publisher: $($m.Package.Identity.Publisher)"
+
+          # The publisher must match the signing certificate subject character for character, or
+          # registration fails with a generic error that looks like a corrupt package.
+          $expected = 'CN=Little Bird Trading LLC, O=Little Bird Trading LLC, L=Newark, S=Delaware, C=US'
+          if ($m.Package.Identity.Publisher -ne $expected) {
+            Write-Error "Publisher does not match the signing identity.`n  manifest: $($m.Package.Identity.Publisher)`n  expected: $expected"
+            exit 1
+          }
+
+          # Every asset the manifest names must exist. A missing one is accepted by the packager
+          # and shows up as a blank tile in the widget picker.
+          $missing = @()
+          Select-String -Path AppxManifest.xml -Pattern 'Assets\\[A-Za-z0-9]+\.png' -AllMatches |
+            ForEach-Object { $_.Matches } | ForEach-Object { $_.Value } | Sort-Object -Unique |
+            ForEach-Object { if (-not (Test-Path $_)) { $missing += $_ } }
+          if ($missing.Count) { Write-Error "Missing package assets: $($missing -join ', ')"; exit 1 }
+          Write-Host "All referenced assets present"
+
       - name: Find the installer
         id: find
         shell: pwsh
