@@ -257,6 +257,16 @@ jobs:
             exit 1
           }
 
+          # The title is a second, independent signal, and it is nearly free. A JVM launch failure
+          # puts up a dialog titled with the EXECUTABLE name, "Reveal the Dream.exe", where the
+          # real window is titled "Reveal the Dream". On 2026-08-02 a missing java.net.http module
+          # produced exactly that: alive, windowed, and a 216x159 "Failed to launch JVM" box. Only
+          # the size check caught it, by a margin that could close if the dialog ever grew.
+          if ($owner.MainWindowTitle -ne 'Reveal the Dream') {
+            Write-Error "Window title is '$($owner.MainWindowTitle)', expected 'Reveal the Dream'. A JVM error dialog is titled with the .exe name."
+            exit 1
+          }
+
           # Give the screenshot step a settled frame to capture rather than a half-painted one.
           Start-Sleep -Seconds 5
 
