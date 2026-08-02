@@ -1,0 +1,182 @@
+name: Build and verify the Windows MSI
+
+# LIVES IN THE PUBLIC INSTALLERS REPO ON PURPOSE.
+#
+# The source repo (none298-dotcom/revealthedream) is PRIVATE, so its Actions minutes are metered
+# and the account is billing blocked: a workflow committed there does not run at all, it is
+# refused before the runner starts. Public repositories get free Actions minutes, so the build
+# lives here and checks the private source out with a read-only token. Source never lands in this
+# repo, only the finished installer does. Same arrangement as MyLinedChart-installers.
+#
+# Do NOT "tidy" this back into the source repo. It will silently stop running.
+#
+# ONE-TIME SETUP, in this repo's Settings > Secrets and variables > Actions:
+#   Secret PRIVATE_REPO_TOKEN: a fine-grained PAT with Contents: Read-only on
+#   none298-dotcom/revealthedream.
+#
+# The verification steps exist because a sibling project failed Microsoft certification with
+# "the product crashes at launch" while its own smoke test was green, because that test ran the
+# app from the SOURCE folder and the shipped installer was missing a file. Every assertion below
+# is made against the INSTALLED artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Private repo branch, tag or SHA to build"
+        default: "main"
+        required: true
+      publish:
+        description: "Attach the MSI to the 'latest' release here"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-verify:
+    # PINNED, not windows-latest. windows-latest moved to Server 2025, where a byte identical
+    # installer passed 1 run in 6 against 3 of 3 on Server 2022 on the sibling project. Only move
+    # this deliberately, and compare over at least six runs.
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out the PRIVATE source
+        uses: actions/checkout@v4
+        with:
+          repository: none298-dotcom/revealthedream
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # No Android SDK is installed here and none is needed: :desktop is plain Kotlin/JVM.
+      # Verified 2026-08-02 on a checkout with local.properties removed and ANDROID_HOME cleared.
+      # If this starts failing with "SDK location not found", something has made :desktop depend
+      # on an Android module, and that is the real bug.
+      - name: Build the MSI
+        working-directory: android
+        run: ./gradlew :desktop:packageMsi --console=plain --no-daemon
+
+      - name: Find the installer
+        id: find
+        shell: pwsh
+        working-directory: android
+        run: |
+          $msi = Get-ChildItem -Recurse -Filter *.msi -Path desktop/build/compose/binaries | Select-Object -First 1
+          if (-not $msi) { Write-Error "No MSI was produced"; exit 1 }
+          "msi=$($msi.FullName)" >> $env:GITHUB_OUTPUT
+          Write-Host "MSI: $($msi.Name)  $([math]::Round($msi.Length/1MB,1)) MB"
+
+      # /qn is MSI's silent switch. Worth noting the shape of the trap: the sibling project used
+      # NSIS, where the switch is /S and is CASE SENSITIVE, and lowercase /s opens the interactive
+      # installer and hangs the job forever.
+      - name: Silent install
+        shell: pwsh
+        run: |
+          $log = "$env:RUNNER_TEMP\install.log"
+          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            "/i", "`"${{ steps.find.outputs.msi }}`"", "/qn", "/norestart", "/L*v", "`"$log`"")
+          Write-Host "msiexec exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { Get-Content $log -Tail 40; Write-Error "Install failed"; exit 1 }
+
+      - name: Locate the INSTALLED executable
+        id: installed
+        shell: pwsh
+        run: |
+          # perUserInstall = true, so it lands under LOCALAPPDATA. Both roots are searched anyway,
+          # because flipping that setting must not quietly turn this gate into a no-op that never
+          # finds the binary and therefore never fails.
+          $roots = @("$env:LOCALAPPDATA", "$env:ProgramFiles", "${env:ProgramFiles(x86)}")
+          $exe = $null
+          foreach ($r in $roots) {
+            if (-not $r) { continue }
+            $f = Get-ChildItem -Path $r -Recurse -Filter "Reveal the Dream.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($f) { $exe = $f.FullName; break }
+          }
+          if (-not $exe) { Write-Error "Installed executable not found"; exit 1 }
+          "exe=$exe" >> $env:GITHUB_OUTPUT
+          Write-Host "Installed: $exe"
+
+      - name: Launch it and assert it is really up
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath "${{ steps.installed.outputs.exe }}" -PassThru
+          Start-Sleep -Seconds 25
+
+          # Liveness is checked and is explicitly NOT the assertion. On the sibling project the
+          # check was "is the process alive", and Electron kept the process up behind a crash
+          # dialog, so three runs scored green while the app showed an error. A JVM app has the
+          # same shape: an uncaught exception on the event thread does not necessarily exit.
+          if ($proc.HasExited) { Write-Error "Exited within 25s, code $($proc.ExitCode)"; exit 1 }
+          Write-Host "Process alive (necessary, not sufficient)"
+
+          # THIS is the real assertion: a window handle means the toolkit got as far as putting a
+          # real window on screen, which a crash on startup never reaches.
+          $proc.Refresh()
+          if ($proc.MainWindowHandle -eq 0) {
+            Write-Error "No main window after 25s. Running, but showing nothing."; exit 1
+          }
+          Write-Host "Main window handle: $($proc.MainWindowHandle)"
+          Write-Host "Window title: $($proc.MainWindowTitle)"
+
+      - name: Screenshot, so a human can look at it
+        if: always()
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          $bmp.Save("$env:RUNNER_TEMP\screen.png")
+          Write-Host "Captured $($b.Width)x$($b.Height)"
+
+      # The failure text may never reach stdout or stderr. On Windows it lands here, and a gate
+      # that does not read this log will tell you everything is fine.
+      - name: Read the Windows Application event log
+        if: always()
+        shell: pwsh
+        run: |
+          $events = Get-WinEvent -FilterHashtable @{
+            LogName='Application'; Level=1,2; StartTime=(Get-Date).AddMinutes(-10)
+          } -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'Reveal|java|jpackage' }
+          if ($events) {
+            $events | Select-Object -First 10 | Format-List TimeCreated, ProviderName, Message
+            if ($events | Where-Object { $_.Message -match 'Reveal the Dream' }) {
+              Write-Error "Application event log carries an error naming this app"; exit 1
+            }
+          } else { Write-Host "No error-level Application events naming this app" }
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-verification
+          path: |
+            ${{ runner.temp }}/screen.png
+            ${{ runner.temp }}/install.log
+          if-no-files-found: warn
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: RevealTheDream-Windows-msi
+          path: android/desktop/build/compose/binaries/**/*.msi
+          if-no-files-found: error
+
+      # Opt in, never automatic. A workflow that publishes to the public as a side effect of being
+      # run is one somebody triggers by accident, and it only happens after every check above has
+      # passed, so an unverified build cannot reach a customer.
+      - name: Publish to the latest release
+        if: ${{ inputs.publish }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $msi = "${{ steps.find.outputs.msi }}"
+          gh release upload latest "$msi" --clobber --repo ${{ github.repository }}
+          Write-Host "Published $(Split-Path $msi -Leaf)"
