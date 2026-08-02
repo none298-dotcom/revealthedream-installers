@@ -32,10 +32,18 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: write     # create/update the Release on this public repo
+  id-token: write     # OIDC token for Azure Trusted Signing, so no cert is stored here
 
 jobs:
   build-and-verify:
+    # `secrets` is not a valid context in a step-level `if:` (GitHub rejects the whole workflow
+    # with "Unrecognized named-value: 'secrets'"). Surfacing them as job env vars is the supported
+    # way for a step to ask "is signing configured here?", which keeps the build working in a
+    # fork with no Azure access.
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     # PINNED, not windows-latest. windows-latest moved to Server 2025, where a byte identical
     # installer passed 1 run in 6 against 3 of 3 on Server 2022 on the sibling project. Only move
     # this deliberately, and compare over at least six runs.
@@ -71,6 +79,60 @@ jobs:
           if (-not $msi) { Write-Error "No MSI was produced"; exit 1 }
           "msi=$($msi.FullName)" >> $env:GITHUB_OUTPUT
           Write-Host "MSI: $($msi.Name)  $([math]::Round($msi.Length/1MB,1)) MB"
+
+      # SIGN BEFORE INSTALLING, so everything below verifies the artifact a customer will run,
+      # not an unsigned near-copy of it.
+      #
+      # trusted-signing-action authenticates via DefaultAzureCredential, which knows nothing about
+      # GitHub OIDC on its own. Without azure/login first it falls through every credential in the
+      # chain (CLI, Developer CLI, Visual Studio) and dies with "SignerSign() failed". azure/login
+      # performs the federated exchange and leaves the runner in a state the action can use.
+      #
+      # Nothing secret lives in this public repo: the three AZURE_* values are identifiers, and
+      # the certificate is short lived, minted by Azure per run.
+      - name: Azure login (federated, OIDC)
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Signs as Little Bird Trading LLC, the identity validation behind this account. The MSI's
+      # own Manufacturer field is set to match in android/desktop/build.gradle.kts; if the signing
+      # identity ever changes, change that too or Windows shows two different companies.
+      - name: Sign the MSI (Azure Trusted Signing)
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
+          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: mlcsigning
+          certificate-profile-name: mlc-public-trust
+          # MUST be absolute. The signing client rejects a relative path outright with
+          # "The file path '...' is not rooted."
+          files: ${{ steps.find.outputs.msi }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # A signing step that quietly did nothing still reports success, so assert on the file.
+      # Countersigner matters as much as signer: without a timestamp the signature dies the day
+      # the certificate expires, and Trusted Signing certificates are short lived by design.
+      - name: Assert the signature actually landed
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature "${{ steps.find.outputs.msi }}"
+          Write-Host "Status:        $($sig.Status)"
+          Write-Host "Signer:        $($sig.SignerCertificate.Subject)"
+          Write-Host "Timestamp:     $($sig.TimeStamperCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { Write-Error "Signature is $($sig.Status), not Valid"; exit 1 }
+          if (-not $sig.TimeStamperCertificate) { Write-Error "Signed but NOT timestamped"; exit 1 }
+          if ($sig.SignerCertificate.Subject -notmatch 'Little Bird Trading') {
+            Write-Error "Signed by an unexpected identity: $($sig.SignerCertificate.Subject)"; exit 1
+          }
 
       # /qn is MSI's silent switch. Worth noting the shape of the trap: the sibling project used
       # NSIS, where the switch is /S and is CASE SENSITIVE, and lowercase /s opens the interactive
