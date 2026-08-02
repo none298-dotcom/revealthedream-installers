@@ -109,12 +109,16 @@ jobs:
           $proc = Start-Process -FilePath $exe -PassThru
           Write-Host "Launched PID $($proc.Id) from $exe"
 
-          # POLL for the window, do not sample once. The first version of this step checked
-          # MainWindowHandle a single time at 25s and failed, while the screenshot taken five
-          # seconds later showed the app running perfectly with its window on screen. A cold
-          # runner takes longer than a warm laptop, and a one-shot check turns that into a
-          # red build for a healthy app. Poll to a generous ceiling instead, and let the
-          # timeout mean something.
+          # THE WINDOW BELONGS TO A CHILD PID. jpackage's launcher .exe re-execs, so the process
+          # Start-Process hands back is not the one that owns the window: this run reported the
+          # launcher as PID 7752 and the window on PID 7776. A check that only ever looks at
+          # $proc.MainWindowHandle can therefore NEVER pass, no matter how long it waits.
+          #
+          # That is what the first version of this step did, and it failed while the screenshot
+          # showed the app running perfectly. The obvious reading was "cold runner, too slow" and
+          # it was wrong; the log now prints how long the window took, and it is 3s. Polling was
+          # not the fix, matching on the binary path was. Both are kept: the poll so a slow start
+          # is not a false failure, the path match so the assertion can succeed at all.
           $deadline = (Get-Date).AddSeconds(150)
           $hwnd = 0
           $owner = $null
