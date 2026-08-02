@@ -1,4 +1,4 @@
-name: Build and verify the Windows MSI
+name: Build and verify the Windows installer
 
 # LIVES IN THE PUBLIC INSTALLERS REPO ON PURPOSE.
 #
@@ -27,7 +27,7 @@ on:
         default: "main"
         required: true
       publish:
-        description: "Attach the MSI to the 'latest' release here"
+        description: "Attach the installer to the 'latest' release here"
         type: boolean
         default: false
 
@@ -66,19 +66,29 @@ jobs:
       # Verified 2026-08-02 on a checkout with local.properties removed and ANDROID_HOME cleared.
       # If this starts failing with "SDK location not found", something has made :desktop depend
       # on an Android module, and that is the real bug.
-      - name: Build the MSI
+      - name: Build the installer
         working-directory: android
-        run: ./gradlew :desktop:packageMsi --console=plain --no-daemon
+        run: ./gradlew :desktop:packageExe --console=plain --no-daemon
 
       - name: Find the installer
         id: find
         shell: pwsh
         working-directory: android
         run: |
-          $msi = Get-ChildItem -Recurse -Filter *.msi -Path desktop/build/compose/binaries | Select-Object -First 1
-          if (-not $msi) { Write-Error "No MSI was produced"; exit 1 }
-          "msi=$($msi.FullName)" >> $env:GITHUB_OUTPUT
-          Write-Host "MSI: $($msi.Name)  $([math]::Round($msi.Length/1MB,1)) MB"
+          # Scoped to the exe/ output directory ON PURPOSE. A bare recursive *.exe search also
+          # matches the app image jpackage stages under app/, which contains a "Reveal the
+          # Dream.exe" that is the APPLICATION, not the installer. Picking that one would install
+          # nothing and still look like it worked.
+          $found = @(Get-ChildItem -Recurse -Filter *.exe -Path desktop/build/compose/binaries/main/exe -ErrorAction SilentlyContinue)
+          if ($found.Count -ne 1) {
+            Write-Error "Expected exactly one installer, found $($found.Count)"
+            $found | ForEach-Object { Write-Host "  $($_.FullName)" }
+            exit 1
+          }
+          $exe = $found[0]
+          "installer=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+          "name=$($exe.Name)" >> $env:GITHUB_OUTPUT
+          Write-Host "Installer: $($exe.Name)  $([math]::Round($exe.Length/1MB,1)) MB"
 
       # SIGN BEFORE INSTALLING, so everything below verifies the artifact a customer will run,
       # not an unsigned near-copy of it.
@@ -98,10 +108,10 @@ jobs:
           tenant-id: ${{ env.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # Signs as Little Bird Trading LLC, the identity validation behind this account. The MSI's
-      # own Manufacturer field is set to match in android/desktop/build.gradle.kts; if the signing
-      # identity ever changes, change that too or Windows shows two different companies.
-      - name: Sign the MSI (Azure Trusted Signing)
+      # Signs as Little Bird Trading LLC, the identity validation behind this account. The
+      # installer's own Manufacturer field is set to match in android/desktop/build.gradle.kts;
+      # if the signing identity ever changes, change that too or Windows shows two companies.
+      - name: Sign the installer (Azure Trusted Signing)
         if: ${{ env.AZURE_CLIENT_ID != '' }}
         uses: azure/trusted-signing-action@v0
         with:
@@ -112,7 +122,7 @@ jobs:
           certificate-profile-name: mlc-public-trust
           # MUST be absolute. The signing client rejects a relative path outright with
           # "The file path '...' is not rooted."
-          files: ${{ steps.find.outputs.msi }}
+          files: ${{ steps.find.outputs.installer }}
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
@@ -124,7 +134,7 @@ jobs:
         if: ${{ env.AZURE_CLIENT_ID != '' }}
         shell: pwsh
         run: |
-          $sig = Get-AuthenticodeSignature "${{ steps.find.outputs.msi }}"
+          $sig = Get-AuthenticodeSignature "${{ steps.find.outputs.installer }}"
           Write-Host "Status:        $($sig.Status)"
           Write-Host "Signer:        $($sig.SignerCertificate.Subject)"
           Write-Host "Timestamp:     $($sig.TimeStamperCertificate.Subject)"
@@ -134,17 +144,23 @@ jobs:
             Write-Error "Signed by an unexpected identity: $($sig.SignerCertificate.Subject)"; exit 1
           }
 
-      # /qn is MSI's silent switch. Worth noting the shape of the trap: the sibling project used
-      # NSIS, where the switch is /S and is CASE SENSITIVE, and lowercase /s opens the interactive
-      # installer and hangs the job forever.
+      # jpackage's exe is a WiX Burn bootstrapper wrapping the same MSI, so it is driven directly
+      # rather than through msiexec, and its silent switch is /quiet. Getting this wrong does not
+      # error: the wrong switch opens the INTERACTIVE installer on a machine with nobody at the
+      # keyboard, and the job hangs until it times out.
       - name: Silent install
         shell: pwsh
         run: |
           $log = "$env:RUNNER_TEMP\install.log"
-          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
-            "/i", "`"${{ steps.find.outputs.msi }}`"", "/qn", "/norestart", "/L*v", "`"$log`"")
-          Write-Host "msiexec exit code: $($p.ExitCode)"
-          if ($p.ExitCode -ne 0) { Get-Content $log -Tail 40; Write-Error "Install failed"; exit 1 }
+          $p = Start-Process "${{ steps.find.outputs.installer }}" -Wait -PassThru -ArgumentList @(
+            "/quiet", "/norestart", "/log", "`"$log`"")
+          Write-Host "Installer exit code: $($p.ExitCode)"
+          # 3010 is "success, reboot required", which is still a successful install.
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            if (Test-Path $log) { Get-Content $log -Tail 40 }
+            Write-Error "Install failed with $($p.ExitCode)"
+            exit 1
+          }
 
       - name: Locate the INSTALLED executable
         id: installed
@@ -157,7 +173,11 @@ jobs:
           $exe = $null
           foreach ($r in $roots) {
             if (-not $r) { continue }
-            $f = Get-ChildItem -Path $r -Recurse -Filter "Reveal the Dream.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            # Excludes the installer itself: it is also a .exe and Burn caches a copy on disk,
+            # so without this the gate could launch the installer and call that a running app.
+            $f = Get-ChildItem -Path $r -Recurse -Filter "Reveal the Dream.exe" -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -ne "${{ steps.find.outputs.installer }}" } |
+                 Select-Object -First 1
             if ($f) { $exe = $f.FullName; break }
           }
           if (-not $exe) { Write-Error "Installed executable not found"; exit 1 }
@@ -280,8 +300,8 @@ jobs:
       - name: Upload the installer
         uses: actions/upload-artifact@v4
         with:
-          name: RevealTheDream-Windows-msi
-          path: android/desktop/build/compose/binaries/**/*.msi
+          name: RevealTheDream-Windows-installer
+          path: android/desktop/build/compose/binaries/main/exe/*.exe
           if-no-files-found: error
 
       # Opt in, never automatic. A workflow that publishes to the public as a side effect of being
@@ -293,6 +313,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $msi = "${{ steps.find.outputs.msi }}"
-          gh release upload latest "$msi" --clobber --repo ${{ github.repository }}
-          Write-Host "Published $(Split-Path $msi -Leaf)"
+          $installer = "${{ steps.find.outputs.installer }}"
+          gh release upload latest "$installer" --clobber --repo ${{ github.repository }}
+          Write-Host "Published $(Split-Path $installer -Leaf)"
