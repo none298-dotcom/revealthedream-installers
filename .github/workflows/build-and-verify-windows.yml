@@ -105,24 +105,72 @@ jobs:
       - name: Launch it and assert it is really up
         shell: pwsh
         run: |
-          $proc = Start-Process -FilePath "${{ steps.installed.outputs.exe }}" -PassThru
-          Start-Sleep -Seconds 25
+          $exe = "${{ steps.installed.outputs.exe }}"
+          $proc = Start-Process -FilePath $exe -PassThru
+          Write-Host "Launched PID $($proc.Id) from $exe"
 
-          # Liveness is checked and is explicitly NOT the assertion. On the sibling project the
-          # check was "is the process alive", and Electron kept the process up behind a crash
-          # dialog, so three runs scored green while the app showed an error. A JVM app has the
-          # same shape: an uncaught exception on the event thread does not necessarily exit.
-          if ($proc.HasExited) { Write-Error "Exited within 25s, code $($proc.ExitCode)"; exit 1 }
-          Write-Host "Process alive (necessary, not sufficient)"
+          # POLL for the window, do not sample once. The first version of this step checked
+          # MainWindowHandle a single time at 25s and failed, while the screenshot taken five
+          # seconds later showed the app running perfectly with its window on screen. A cold
+          # runner takes longer than a warm laptop, and a one-shot check turns that into a
+          # red build for a healthy app. Poll to a generous ceiling instead, and let the
+          # timeout mean something.
+          $deadline = (Get-Date).AddSeconds(150)
+          $hwnd = 0
+          $owner = $null
+          while ((Get-Date) -lt $deadline) {
+            # Liveness is checked and is explicitly NOT the assertion. On the sibling project the
+            # check was "is the process alive", and Electron kept the process up behind a crash
+            # dialog, so three runs scored green while the app showed an error. A JVM app has the
+            # same shape: an uncaught exception on the event thread does not necessarily exit.
+            if ($proc.HasExited) {
+              Write-Error "Exited after $([int]((Get-Date) - $proc.StartTime).TotalSeconds)s, code $($proc.ExitCode)"
+              exit 1
+            }
 
-          # THIS is the real assertion: a window handle means the toolkit got as far as putting a
-          # real window on screen, which a crash on startup never reaches.
-          $proc.Refresh()
-          if ($proc.MainWindowHandle -eq 0) {
-            Write-Error "No main window after 25s. Running, but showing nothing."; exit 1
+            # Check the launched process first, then any process running THIS SAME BINARY. The
+            # second case covers a launcher that re-execs into a child PID; without it a healthy
+            # app would read as windowless. Matching on the path and not on the window title is
+            # deliberate, so a leftover window from an earlier run cannot satisfy this.
+            $proc.Refresh()
+            if ($proc.MainWindowHandle -ne 0) { $hwnd = $proc.MainWindowHandle; $owner = $proc; break }
+
+            $sibling = Get-Process | Where-Object {
+              $_.MainWindowHandle -ne 0 -and $_.Path -eq $exe
+            } | Select-Object -First 1
+            if ($sibling) { $hwnd = $sibling.MainWindowHandle; $owner = $sibling; break }
+
+            Start-Sleep -Seconds 3
           }
-          Write-Host "Main window handle: $($proc.MainWindowHandle)"
-          Write-Host "Window title: $($proc.MainWindowTitle)"
+
+          if ($hwnd -eq 0) {
+            Write-Error "Alive for 150s with no window. Running, but showing nothing."
+            exit 1
+          }
+          $waited = [int]((Get-Date) - $proc.StartTime).TotalSeconds
+          Write-Host "Window appeared after ${waited}s"
+          Write-Host "  PID:    $($owner.Id)$(if ($owner.Id -ne $proc.Id) { ' (child of the launcher)' })"
+          Write-Host "  Path:   $($owner.Path)"
+          Write-Host "  Handle: $hwnd"
+          Write-Host "  Title:  $($owner.MainWindowTitle)"
+
+          # A window that exists but is a 1x1 sliver, or an error dialog, is not the app running.
+          # The DMG gate learned this the same way and asserts a minimum size for the same reason.
+          Add-Type -Namespace W -Name N -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+public struct RECT { public int L, T, R, B; }
+'@
+          $r = New-Object W.N+RECT
+          [void][W.N]::GetWindowRect($hwnd, [ref]$r)
+          $w = $r.R - $r.L; $h = $r.B - $r.T
+          Write-Host "  Size:   ${w}x${h}"
+          if ($w -lt 300 -or $h -lt 300) {
+            Write-Error "Window is only ${w}x${h}. Too small to be the app."
+            exit 1
+          }
+
+          # Give the screenshot step a settled frame to capture rather than a half-painted one.
+          Start-Sleep -Seconds 5
 
       - name: Screenshot, so a human can look at it
         if: always()
