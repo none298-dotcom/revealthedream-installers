@@ -90,10 +90,26 @@ jobs:
         shell: pwsh
         working-directory: windows/WidgetProvider
         run: |
-          dotnet restore RevealWidgetProvider.csproj
+          dotnet restore RevealWidgetProvider.csproj -r win-x64
           if ($LASTEXITCODE -ne 0) { Write-Error "Restore failed"; exit 1 }
-          msbuild RevealWidgetProvider.csproj /p:Configuration=Release /p:Platform=x64 /v:minimal /nologo
-          if ($LASTEXITCODE -ne 0) { Write-Error "Widget provider does not compile"; exit 1 }
+
+          # PUBLISH, not build. Trimming only runs on publish, and a plain build would quietly
+          # produce the untrimmed 40 MB of runtime while the project file claimed otherwise.
+          msbuild RevealWidgetProvider.csproj /t:Publish /p:Configuration=Release /p:Platform=x64 /v:minimal /nologo
+          if ($LASTEXITCODE -ne 0) { Write-Error "Widget provider does not build"; exit 1 }
+
+          $out = "bin/x64/Release/net8.0-windows10.0.22621.0/win-x64/publish"
+          if (-not (Test-Path "$out/RevealWidgetProvider.exe")) {
+            Write-Error "No provider executable at $out"; exit 1
+          }
+          $size = [math]::Round(((Get-ChildItem $out -Recurse -File | Measure-Object Length -Sum).Sum)/1MB, 1)
+          $count = (Get-ChildItem $out -Recurse -File).Count
+          Write-Host "Provider output: $count files, $size MB"
+
+          # Guard the whole point of trimming. Untrimmed this was 213 files and about 40 MB, so a
+          # silent regression back to that would double the download again with nothing reporting
+          # it. Generous ceiling: this is a tripwire, not a budget.
+          if ($size -gt 25) { Write-Error "Provider is ${size} MB. Trimming is not taking effect."; exit 1 }
 
       - name: Check the package manifest
         shell: pwsh
@@ -191,7 +207,7 @@ jobs:
           Copy-Item "${{ steps.msix.outputs.msix }}" "$res/RevealTheDreamWidgets.msix"
           # The provider executable and its self-contained runtime live NEXT TO the app, which is
           # exactly what the package's external location points at.
-          Copy-Item "windows/WidgetProvider/bin/x64/Release/net8.0-windows10.0.22621.0/win-x64/*" $res -Recurse -Force
+          Copy-Item "windows/WidgetProvider/bin/x64/Release/net8.0-windows10.0.22621.0/win-x64/publish/*" $res -Recurse -Force
           Write-Host "Staged $((Get-ChildItem $res -Recurse -File).Count) files"
 
       # No Android SDK is installed here and none is needed: :desktop is plain Kotlin/JVM.
