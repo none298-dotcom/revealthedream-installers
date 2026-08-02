@@ -80,6 +80,14 @@ jobs:
       #
       # It also validates the package manifest, because a malformed AppxManifest fails registration
       # on a customer's machine with an error that reads like a corrupt download.
+      # global.json in that directory pins the SDK to 8.x; see the note in it for why. Installing
+      # it explicitly rather than relying on the image, because the image's default is newer and
+      # global.json would then fail outright instead of falling back.
+      - name: .NET 8 for the widget provider
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
       - name: Compile the widget provider
         shell: pwsh
         working-directory: windows/WidgetProvider
