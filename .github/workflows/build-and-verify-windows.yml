@@ -156,10 +156,12 @@ jobs:
 
           # A window that exists but is a 1x1 sliver, or an error dialog, is not the app running.
           # The DMG gate learned this the same way and asserts a minimum size for the same reason.
-          Add-Type -Namespace W -Name N -MemberDefinition @'
-[DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-public struct RECT { public int L, T, R, B; }
-'@
+          # Built as a joined single-quoted string, NOT a @'...'@ here-string: PowerShell requires
+          # the here-string terminator at column 0, which is illegal inside a YAML block scalar
+          # and makes the whole workflow file unparseable.
+          $sig = 'public struct RECT { public int L, T, R, B; } ' +
+                 '[DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);'
+          Add-Type -Namespace W -Name N -MemberDefinition $sig
           $r = New-Object W.N+RECT
           [void][W.N]::GetWindowRect($hwnd, [ref]$r)
           $w = $r.R - $r.L; $h = $r.B - $r.T
