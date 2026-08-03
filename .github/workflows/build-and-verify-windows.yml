@@ -462,3 +462,33 @@ jobs:
           $installer = "${{ steps.find.outputs.installer }}"
           gh release upload latest "$installer" --clobber --repo ${{ github.repository }}
           Write-Host "Published $(Split-Path $installer -Leaf)"
+
+          # UPDATE THE MANIFEST IN THE SAME STEP. The website resolves /download/windows through
+          # latest.json, so an installer uploaded without updating it leaves the site serving the
+          # PREVIOUS build while the new one sits in the release unreferenced. That is not
+          # hypothetical: it is exactly what happened between 2026-08-02 and 08-03, when three
+          # commits including security fixes were published to the release and the site kept
+          # handing out the older build, because the manifest was maintained by hand.
+          #
+          # Everything below is read back from the asset GitHub actually stored, never assumed.
+          # GitHub rewrites spaces in asset names to dots, so a constructed filename is wrong.
+          $asset = gh release view latest --repo ${{ github.repository }} --json assets |
+                   ConvertFrom-Json |
+                   Select-Object -ExpandProperty assets |
+                   Where-Object { $_.name -like "*.exe" } |
+                   Select-Object -First 1
+          if (-not $asset) { Write-Error "No .exe on the release after upload"; exit 1 }
+
+          gh release download latest --repo ${{ github.repository }} --pattern latest.json --output latest.json --clobber
+          $manifest = Get-Content latest.json -Raw | ConvertFrom-Json
+          $manifest.winUrl = "https://github.com/${{ github.repository }}/releases/download/latest/$($asset.name)"
+          $manifest.winSizeBytes = $asset.size
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content latest.json -Encoding utf8
+          gh release upload latest latest.json --clobber --repo ${{ github.repository }}
+
+          Write-Host "Manifest now points at $($asset.name), $($asset.size) bytes"
+
+          # The site caches the manifest for 5 minutes, so this asserts the RELEASE is consistent,
+          # which is the part this job controls. A mismatch here means the upload and the manifest
+          # disagree, and the site would serve a size that does not match the file.
+          if ($manifest.winSizeBytes -ne $asset.size) { Write-Error "Manifest disagrees with the asset"; exit 1 }
