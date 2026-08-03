@@ -298,6 +298,63 @@ jobs:
             exit 1
           }
 
+      # ASSERT WHAT MICROSOFT CERTIFICATION ASSERTS, not what we happen to care about.
+      #
+      # MyLinedChart was rejected twice by Store certification while its own smoke test was green,
+      # because that test downloaded, verified the signature, silent-installed exactly as the
+      # certifier does, launched the app and proved it survived, and then checked NONE of what
+      # certification checks. A green run and a rejection letter sat side by side for days. See
+      # docs/windows-store-certification.md in that repo.
+      #
+      # The rejection was 10.1.2.10 "no accessible method of being launched" and 10.2.7 "no entry
+      # in the Add or Remove Programs list", from a per-user install. The certifier installs
+      # elevated and then inspects the machine as a normal user, so a shortcut in the installing
+      # user's profile and an uninstall entry under HKCU are both invisible to them.
+      #
+      # Finding either under the per-user location is the DIAGNOSIS, so this reports it explicitly
+      # rather than just failing.
+      - name: Assert the install is per-machine, as certification checks
+        shell: pwsh
+        run: |
+          $fail = $false
+
+          $allUsers = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs"
+          $lnk = Get-ChildItem $allUsers -Recurse -Filter "*Reveal*.lnk" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($lnk) {
+            Write-Host "OK   Start Menu shortcut (All Users): $($lnk.FullName)"
+          } else {
+            $perUser = Get-ChildItem "$env:APPDATA\Microsoft\Windows\Start Menu\Programs" -Recurse -Filter "*Reveal*.lnk" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($perUser) {
+              Write-Error "Shortcut is PER-USER at $($perUser.FullName). A certifier inspecting the machine will not see it. This is the 10.1.2.10 rejection."
+            } else {
+              Write-Error "No Start Menu shortcut anywhere. This is the 10.1.2.10 rejection."
+            }
+            $fail = $true
+          }
+
+          # Add/Remove Programs reads HKLM. Both views, since a 32-bit MSI lands in WOW6432Node.
+          $hklm = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+          ) | ForEach-Object { Get-ItemProperty $_ -ErrorAction SilentlyContinue } |
+              Where-Object { $_.DisplayName -like "*Reveal the Dream*" } | Select-Object -First 1
+
+          if ($hklm -and $hklm.UninstallString) {
+            Write-Host "OK   Add/Remove Programs entry: $($hklm.DisplayName)"
+            Write-Host "     UninstallString: $($hklm.UninstallString)"
+          } else {
+            $hkcu = Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DisplayName -like "*Reveal the Dream*" } | Select-Object -First 1
+            if ($hkcu) {
+              Write-Error "Uninstall entry is under HKCU ($($hkcu.DisplayName)), not HKLM. Add/Remove Programs reads HKLM. This is the 10.2.7 rejection."
+            } else {
+              Write-Error "No uninstall entry with an UninstallString in HKLM. This is the 10.2.7 rejection."
+            }
+            $fail = $true
+          }
+
+          if ($fail) { exit 1 }
+
       - name: Locate the INSTALLED executable
         id: installed
         shell: pwsh
