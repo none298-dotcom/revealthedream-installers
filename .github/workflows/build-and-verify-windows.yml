@@ -30,6 +30,14 @@ on:
         description: "Attach the installer to the 'latest' release here"
         type: boolean
         default: false
+      # OFF by default until it has been green once. This path has never run on a Windows runner:
+      # a failure in it stops the publish steps, and defaulting it on would mean the next routine
+      # installer release is the run that discovers whether Set-DisplayResolution works on this
+      # image. Turn it on deliberately, watch it pass, then flip this default.
+      screenshots:
+        description: "Shoot Microsoft Store screenshots of the installed build"
+        type: boolean
+        default: false
 
 permissions:
   contents: write     # create/update the Release on this public repo
@@ -489,6 +497,36 @@ jobs:
               Write-Error "Application event log carries an error naming this app"; exit 1
             }
           } else { Write-Host "No error-level Application events naming this app" }
+
+      # MICROSOFT STORE SCREENSHOTS, of the INSTALLED build.
+      #
+      # Microsoft wants at least one screenshot at 1366x768 or larger and there is no Windows 11
+      # machine on this project, so this runner is the only place they can come from. The script
+      # lives in the private source repo, next to the app it photographs, and is checked out above.
+      #
+      # Runs AFTER every verification gate, deliberately: it kills and relaunches the app several
+      # times, and doing that before the launch assertion or the event-log read would let a
+      # screenshot failure masquerade as an app failure.
+      #
+      # A failure here stops the publish steps below. That is on purpose. The alternative is a job
+      # that goes green having produced nothing usable, and a gate that cannot fail is the worst
+      # kind. Turn the `screenshots` input off to publish an installer without them.
+      - name: Shoot Microsoft Store screenshots
+        if: ${{ inputs.screenshots }}
+        shell: pwsh
+        run: |
+          ./tools/windows-store-screenshots.ps1 `
+            -InstalledExe "${{ steps.installed.outputs.exe }}" `
+            -RepoRoot "${{ github.workspace }}" `
+            -OutputDir "$env:RUNNER_TEMP\store-screenshots"
+
+      - name: Upload the store screenshots
+        if: ${{ inputs.screenshots }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: microsoft-store-screenshots
+          path: ${{ runner.temp }}/store-screenshots/*.png
+          if-no-files-found: error
 
       - name: Upload evidence
         if: always()
