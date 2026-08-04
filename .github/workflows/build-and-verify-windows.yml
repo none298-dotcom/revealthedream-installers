@@ -592,35 +592,45 @@ jobs:
           #
           # Everything below is read back from the asset GitHub actually stored, never assumed.
           # GitHub rewrites spaces in asset names to dots, so a constructed filename is wrong.
-          $asset = gh release view latest --repo ${{ github.repository }} --json assets |
+          # SELECT BY VERSION, NOT "the first .exe". `--clobber` only replaces an asset with the
+          # SAME name, and every version has a new name, so the release accumulates them:
+          # 1.1.0 and 1.2.0 now both sit there. `Select-Object -First 1` picked 1.1.0 on the
+          # 2026-08-04 publish and pointed the manifest at the OLD build while claiming the new
+          # version, which would have told every customer to update and then handed them the same
+          # build back. An update loop that never updates.
+          $version = "${{ steps.find.outputs.version }}"
+          $candidates = @(gh release view latest --repo ${{ github.repository }} --json assets |
                    ConvertFrom-Json |
                    Select-Object -ExpandProperty assets |
-                   Where-Object { $_.name -like "*.exe" } |
-                   Select-Object -First 1
-          if (-not $asset) { Write-Error "No .exe on the release after upload"; exit 1 }
+                   Where-Object { $_.name -like "*.exe" -and $_.name -like "*$version*" })
+          if ($candidates.Count -ne 1) {
+            Write-Error "Expected exactly one .exe on the release naming $version, found $($candidates.Count)."
+            $candidates | ForEach-Object { Write-Host "  $($_.name)" }
+            exit 1
+          }
+          $asset = $candidates[0]
 
           gh release download latest --repo ${{ github.repository }} --pattern latest.json --output latest.json --clobber
           $manifest = Get-Content latest.json -Raw | ConvertFrom-Json
           $manifest.winUrl = "https://github.com/${{ github.repository }}/releases/download/latest/$($asset.name)"
           $manifest.winSizeBytes = $asset.size
           # winVersion IS THE UPDATE CHECK. DesktopUpdateCheck.kt fetches this manifest and compares
-          # this exact field against its own APP_VERSION. It was not being written here, so the
-          # download link would have started serving 1.2.0 while the manifest still said 1.1.0 and
-          # every installed copy stayed silent forever. Caught 2026-08-04 by reading the live
-          # manifest before publishing rather than after.
-          $manifest.winVersion = "${{ steps.find.outputs.version }}"
-          $manifest | ConvertTo-Json -Depth 5 | Set-Content latest.json -Encoding utf8
-          gh release upload latest latest.json --clobber --repo ${{ github.repository }}
+          # this exact field against its own APP_VERSION. It was not being written here at all, so
+          # the download link would have started serving 1.2.0 while the manifest still said 1.1.0
+          # and every installed copy stayed silent forever.
+          $manifest.winVersion = $version
 
-          Write-Host "Manifest now points at $($asset.name), $($asset.size) bytes"
-
-          # The site caches the manifest for 5 minutes, so this asserts the RELEASE is consistent,
-          # which is the part this job controls. A mismatch here means the upload and the manifest
-          # disagree, and the site would serve a size that does not match the file.
+          # ASSERT BEFORE UPLOADING. These checks used to run AFTER `gh release upload latest.json`,
+          # which meant the broken manifest was already live by the time they failed: the job went
+          # red having published exactly the state it was meant to prevent, and it had to be
+          # repaired by hand. A gate that fires after the damage is a report, not a gate.
           if ($manifest.winSizeBytes -ne $asset.size) { Write-Error "Manifest disagrees with the asset"; exit 1 }
-          if ($manifest.winVersion -ne "${{ steps.find.outputs.version }}") { Write-Error "Manifest winVersion did not take"; exit 1 }
+          if ($manifest.winVersion -ne $version) { Write-Error "Manifest winVersion did not take"; exit 1 }
           if ($asset.name -notlike "*$($manifest.winVersion)*") {
-            Write-Error "Manifest says $($manifest.winVersion) but the published asset is $($asset.name). Customers would be offered a build that is not the one named."
+            Write-Error "Manifest says $($manifest.winVersion) but the asset is $($asset.name). Customers would be offered a build that is not the one named."
             exit 1
           }
-          Write-Host "Manifest winVersion is $($manifest.winVersion), matching the published asset"
+          if ($manifest.winUrl -notlike "*$($asset.name)") { Write-Error "winUrl does not end in the asset name"; exit 1 }
+
+          gh release upload latest latest.json --clobber --repo ${{ github.repository }}
+          Write-Host "Manifest now points at $($asset.name), $($asset.size) bytes, winVersion $($manifest.winVersion)"
