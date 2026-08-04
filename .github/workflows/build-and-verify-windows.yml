@@ -250,6 +250,31 @@ jobs:
           "name=$($exe.Name)" >> $env:GITHUB_OUTPUT
           Write-Host "Installer: $($exe.Name)  $([math]::Round($exe.Length/1MB,1)) MB"
 
+          # THE VERSION, from three places that must agree, because the manifest's `winVersion` is
+          # what every installed copy compares itself against. Get it wrong and the update check is
+          # silently dead: customers are simply never told a new build exists, and nothing anywhere
+          # reports a problem. That is not hypothetical, it is what this repo did until 2026-08-04,
+          # when the publish step wrote winUrl and winSizeBytes and left winVersion untouched.
+          #
+          #   1. build.gradle.kts packageVersion  -- what jpackage was told to build
+          #   2. the installer's own file name    -- what jpackage actually produced
+          #   3. Main.kt APP_VERSION              -- what the running app compares with
+          #
+          # Three sources rather than one because each catches a different mistake: a bump that
+          # missed a file, a stale build directory serving an older exe, and the app-versus-package
+          # drift the comment on APP_VERSION already warns about.
+          $gradleVersion = (Select-String -Path desktop/build.gradle.kts -Pattern 'packageVersion\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $appVersion = (Select-String -Path desktop/src/main/kotlin/com/revealthedream/desktop/Main.kt -Pattern 'APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($exe.Name -notmatch '(\d+\.\d+\.\d+)') { Write-Error "Cannot read a version out of '$($exe.Name)'"; exit 1 }
+          $fileVersion = $Matches[1]
+
+          Write-Host "Version: gradle=$gradleVersion  file=$fileVersion  app=$appVersion"
+          if ($gradleVersion -ne $fileVersion -or $gradleVersion -ne $appVersion) {
+            Write-Error "Version disagreement. build.gradle.kts=$gradleVersion, installer=$fileVersion, Main.kt APP_VERSION=$appVersion. All three must match or the update check lies to customers."
+            exit 1
+          }
+          "version=$gradleVersion" >> $env:GITHUB_OUTPUT
+
       # SIGN BEFORE INSTALLING, so everything below verifies the artifact a customer will run,
       # not an unsigned near-copy of it. Auth was established by the login step further up.
       # Signs as Little Bird Trading LLC, the identity validation behind this account. The
@@ -578,6 +603,12 @@ jobs:
           $manifest = Get-Content latest.json -Raw | ConvertFrom-Json
           $manifest.winUrl = "https://github.com/${{ github.repository }}/releases/download/latest/$($asset.name)"
           $manifest.winSizeBytes = $asset.size
+          # winVersion IS THE UPDATE CHECK. DesktopUpdateCheck.kt fetches this manifest and compares
+          # this exact field against its own APP_VERSION. It was not being written here, so the
+          # download link would have started serving 1.2.0 while the manifest still said 1.1.0 and
+          # every installed copy stayed silent forever. Caught 2026-08-04 by reading the live
+          # manifest before publishing rather than after.
+          $manifest.winVersion = "${{ steps.find.outputs.version }}"
           $manifest | ConvertTo-Json -Depth 5 | Set-Content latest.json -Encoding utf8
           gh release upload latest latest.json --clobber --repo ${{ github.repository }}
 
@@ -587,3 +618,9 @@ jobs:
           # which is the part this job controls. A mismatch here means the upload and the manifest
           # disagree, and the site would serve a size that does not match the file.
           if ($manifest.winSizeBytes -ne $asset.size) { Write-Error "Manifest disagrees with the asset"; exit 1 }
+          if ($manifest.winVersion -ne "${{ steps.find.outputs.version }}") { Write-Error "Manifest winVersion did not take"; exit 1 }
+          if ($asset.name -notlike "*$($manifest.winVersion)*") {
+            Write-Error "Manifest says $($manifest.winVersion) but the published asset is $($asset.name). Customers would be offered a build that is not the one named."
+            exit 1
+          }
+          Write-Host "Manifest winVersion is $($manifest.winVersion), matching the published asset"
