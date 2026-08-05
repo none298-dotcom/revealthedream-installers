@@ -619,18 +619,56 @@ jobs:
           # the download link would have started serving 1.2.0 while the manifest still said 1.1.0
           # and every installed copy stayed silent forever.
           $manifest.winVersion = $version
+          $manifest.buildEpoch = [int][double]::Parse((Get-Date -UFormat %s))
 
-          # ASSERT BEFORE UPLOADING. These checks used to run AFTER `gh release upload latest.json`,
-          # which meant the broken manifest was already live by the time they failed: the job went
-          # red having published exactly the state it was meant to prevent, and it had to be
-          # repaired by hand. A gate that fires after the damage is a report, not a gate.
-          if ($manifest.winSizeBytes -ne $asset.size) { Write-Error "Manifest disagrees with the asset"; exit 1 }
-          if ($manifest.winVersion -ne $version) { Write-Error "Manifest winVersion did not take"; exit 1 }
-          if ($asset.name -notlike "*$($manifest.winVersion)*") {
-            Write-Error "Manifest says $($manifest.winVersion) but the asset is $($asset.name). Customers would be offered a build that is not the one named."
+          # WRITE IT BACK TO DISK. `gh release upload` sends the FILE, and every line above only
+          # mutated an in-memory object. Without this the freshly downloaded, unmodified latest.json
+          # is what gets uploaded.
+          #
+          # This line existed, was dropped when the step was rewritten on 2026-08-04, and the
+          # rewrite shipped green: the 1.3.0 run uploaded the installer, logged "Manifest now points
+          # at Reveal.the.Dream-1.3.0.exe ... winVersion 1.3.0", passed all four assertions, and
+          # left the published manifest still saying 1.2.0. Every assertion tested `$manifest`, the
+          # object that was correct, rather than the file that was not.
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content latest.json -Encoding utf8
+
+          # ASSERT BEFORE UPLOADING, AND ASSERT THE FILE. These checks used to run AFTER
+          # `gh release upload latest.json`, which meant the broken manifest was already live by the
+          # time they failed: the job went red having published exactly the state it was meant to
+          # prevent. A gate that fires after the damage is a report, not a gate.
+          #
+          # They now re-read latest.json from disk instead of inspecting `$manifest`. Checking the
+          # in-memory object could only ever confirm the assignments a few lines above it, which is
+          # why it went on passing while the artifact was wrong. Verify the thing you are about to
+          # ship, not the variable you built it from.
+          $onDisk = Get-Content latest.json -Raw | ConvertFrom-Json
+          if ($onDisk.winSizeBytes -ne $asset.size) { Write-Error "Manifest on disk disagrees with the asset"; exit 1 }
+          if ($onDisk.winVersion -ne $version) { Write-Error "Manifest on disk says $($onDisk.winVersion), expected $version. The write-back did not happen."; exit 1 }
+          if ($asset.name -notlike "*$($onDisk.winVersion)*") {
+            Write-Error "Manifest says $($onDisk.winVersion) but the asset is $($asset.name). Customers would be offered a build that is not the one named."
             exit 1
           }
-          if ($manifest.winUrl -notlike "*$($asset.name)") { Write-Error "winUrl does not end in the asset name"; exit 1 }
+          if ($onDisk.winUrl -notlike "*$($asset.name)") { Write-Error "winUrl does not end in the asset name"; exit 1 }
 
           gh release upload latest latest.json --clobber --repo ${{ github.repository }}
-          Write-Host "Manifest now points at $($asset.name), $($asset.size) bytes, winVersion $($manifest.winVersion)"
+
+          # AND ASSERT WHAT ACTUALLY LANDED. Everything above proves the bytes were correct when
+          # they left this runner. It does not prove the upload replaced anything: `--clobber` can
+          # be a no-op against an unexpected asset name, and a partial upload is possible. So pull
+          # the published manifest back down through the API and read it.
+          #
+          # The API, not the browser download URL: release assets sit behind a CDN that ignores
+          # cache-busting query strings, so a fetch of the public URL can return the previous file
+          # for minutes and would make a correct publish look broken (and, worse, a broken one look
+          # fine on the next run).
+          $assetId = gh api "repos/${{ github.repository }}/releases/tags/latest" --jq '.assets[] | select(.name=="latest.json") | .id'
+          $published = gh api -H "Accept: application/octet-stream" "repos/${{ github.repository }}/releases/assets/$assetId" | ConvertFrom-Json
+          if ($published.winVersion -ne $version) {
+            Write-Error "PUBLISHED manifest says $($published.winVersion), expected $version. The upload did not take."
+            exit 1
+          }
+          if ($published.winUrl -notlike "*$($asset.name)") {
+            Write-Error "PUBLISHED winUrl is $($published.winUrl), expected it to end in $($asset.name)."
+            exit 1
+          }
+          Write-Host "Published manifest verified: winVersion $($published.winVersion), $($published.winUrl)"
