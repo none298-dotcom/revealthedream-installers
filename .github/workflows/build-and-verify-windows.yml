@@ -394,6 +394,55 @@ jobs:
             exit 1
           }
 
+      # Partner Center's "Standard install scenarios" asks for this installer's return code for
+      # each of: installation successful, cancelled by user, application already exists,
+      # installation already in progress, disk space full, reboot required, network failure, and
+      # package rejected. Those drive the message a customer sees when an install goes wrong.
+      #
+      # The codes are MEASURED here rather than copied from a table of standard MSI values, because
+      # this project's whole history is things that were true of the general case and false of this
+      # build. Only the scenarios that can actually be produced on a runner are measured; the rest
+      # are reported as unmeasured rather than guessed, so nobody types a number into a Microsoft
+      # form on my say-so.
+      - name: Measure the installer's return codes
+        shell: pwsh
+        run: |
+          $installer = "${{ steps.find.outputs.installer }}"
+          $declared = (Get-Content "tools/windows-store-install-parameters.txt" -Raw).Trim() -split '\s+'
+          $results = @()
+
+          # Already installed. The install step above has run, so this second identical install is
+          # the "application already exists" path a customer hits when the Store reinstalls.
+          $p = Start-Process $installer -Wait -PassThru -ArgumentList $declared
+          $results += [pscustomobject]@{ Scenario = "Application already exists (reinstall over itself)"; Code = $p.ExitCode }
+
+          # Two at once. Windows Installer serialises, so the loser reports already-in-progress.
+          $a = Start-Process $installer -PassThru -ArgumentList $declared
+          Start-Sleep -Milliseconds 400
+          $b = Start-Process $installer -PassThru -ArgumentList $declared
+          $a.WaitForExit(180000) | Out-Null
+          $b.WaitForExit(180000) | Out-Null
+          $results += [pscustomobject]@{ Scenario = "Installation already in progress (second of two)"; Code = "$($a.ExitCode) and $($b.ExitCode)" }
+
+          # An argument the bootstrapper does not understand. This is what /S actually did.
+          $p = Start-Process $installer -PassThru -ArgumentList @("/S")
+          if ($p.WaitForExit(60000)) {
+            $results += [pscustomobject]@{ Scenario = "Unrecognised switch /S (the NSIS one)"; Code = $p.ExitCode }
+          } else {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            $results += [pscustomobject]@{ Scenario = "Unrecognised switch /S (the NSIS one)"; Code = "HUNG, no exit within 60s" }
+          }
+
+          $results | Format-Table -AutoSize | Out-String | Write-Host
+
+          $lines = @("## Measured installer return codes", "", "| Scenario | Exit code |", "|---|---|")
+          foreach ($r in $results) { $lines += "| $($r.Scenario) | ``$($r.Code)`` |" }
+          $lines += ""
+          $lines += "Successful install is measured by the Silent install step above."
+          $lines += "Disk full, reboot required, network failure and package rejected are NOT measurable"
+          $lines += "on a runner and are deliberately left unmeasured rather than guessed."
+          $lines -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
       # ASSERT WHAT MICROSOFT CERTIFICATION ASSERTS, not what we happen to care about.
       #
       # MyLinedChart was rejected twice by Store certification while its own smoke test was green,
