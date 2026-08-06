@@ -30,14 +30,19 @@ on:
         description: "Attach the installer to the 'latest' release here"
         type: boolean
         default: false
-      # OFF by default until it has been green once. This path has never run on a Windows runner:
-      # a failure in it stops the publish steps, and defaulting it on would mean the next routine
-      # installer release is the run that discovers whether Set-DisplayResolution works on this
-      # image. Turn it on deliberately, watch it pass, then flip this default.
+      # ON by default as of 2026-08-06, run 31078467934, which is the first time this whole path
+      # went green on a Windows runner: resolution change, four store screenshots, and the click
+      # test that presses "I Did It" and asserts a check-in was actually recorded (completed days
+      # 11 -> 12, 2328 sample points changed). The note this replaces said to turn it on
+      # deliberately, watch it pass, then flip the default. That has now happened.
+      #
+      # It stays a switch rather than becoming unconditional because a failure here stops the
+      # publish steps, which is the correct default but not always what you want: turn it off to
+      # ship an installer when the screenshot path itself is what is broken.
       screenshots:
-        description: "Shoot Microsoft Store screenshots of the installed build"
+        description: "Shoot Microsoft Store screenshots and run the click test"
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: write     # create/update the Release on this public repo
