@@ -43,6 +43,19 @@ on:
         description: "Shoot Microsoft Store screenshots and run the click test"
         type: boolean
         default: true
+      # VERIFY WHAT MICROSOFT WILL ACTUALLY DOWNLOAD, rather than a sibling build of the same
+      # source. Added 2026-08-06: the binary behind the submission's package URL turned out not to
+      # be the one any gate had ever run against. Two builds of identical source differ in bytes
+      # anyway, because signing timestamps and MSI GUIDs are not reproducible, so "same version"
+      # and "same source" do not add up to "verified". This project's own rule is to test the
+      # PACKAGE, and the package is whatever is at that URL.
+      #
+      # Given a URL, the build step is skipped entirely and every gate below runs against the
+      # downloaded bytes instead.
+      package_url:
+        description: "Verify THIS exact installer URL instead of building one (leave blank to build)"
+        type: string
+        default: ""
 
 permissions:
   contents: write     # create/update the Release on this public repo
@@ -232,11 +245,41 @@ jobs:
       # finds it, so building first would ship an installer with no widget package and nothing
       # would report the omission.
       - name: Build the installer
+        if: ${{ inputs.package_url == '' }}
         working-directory: android
         run: ./gradlew :desktop:packageExe --console=plain --no-daemon
 
+      # The submitted artifact, fetched and pinned by hash so the log records exactly which bytes
+      # every assertion below is about.
+      - name: Download the installer under test
+        id: fetch
+        if: ${{ inputs.package_url != '' }}
+        shell: pwsh
+        run: |
+          $url = "${{ inputs.package_url }}"
+          $out = Join-Path $env:RUNNER_TEMP "package-under-test.exe"
+          Write-Host "Fetching $url"
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+          $item = Get-Item $out
+          $hash = (Get-FileHash $out -Algorithm SHA256).Hash
+          Write-Host "Bytes : $($item.Length)"
+          Write-Host "SHA256: $hash"
+
+          # A redirect or an error page saved as .exe would otherwise sail through and fail later
+          # as something confusing. MZ is the DOS header every Windows executable starts with.
+          $head = [System.IO.File]::ReadAllBytes($out)[0..1]
+          if ($head[0] -ne 0x4D -or $head[1] -ne 0x5A) {
+            Write-Error "That URL did not return a Windows executable. First bytes were $($head -join ',')."
+            exit 1
+          }
+          "installer=$out" >> $env:GITHUB_OUTPUT
+          "name=$($item.Name)" >> $env:GITHUB_OUTPUT
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          "## Package under test`n`n``$url```n`nSHA256 ``$hash```n`n$($item.Length) bytes" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
       - name: Find the installer
         id: find
+        if: ${{ inputs.package_url == '' }}
         shell: pwsh
         working-directory: android
         run: |
@@ -285,8 +328,23 @@ jobs:
       # Signs as Little Bird Trading LLC, the identity validation behind this account. The
       # installer's own Manufacturer field is set to match in android/desktop/build.gradle.kts;
       # if the signing identity ever changes, change that too or Windows shows two companies.
+      # Every step below refers to this, so the built path and the downloaded path converge here
+      # rather than each later step repeating the same conditional and one of them getting it wrong.
+      - name: Resolve the installer under test
+        id: installed_pkg
+        shell: pwsh
+        run: |
+          $built = "${{ steps.find.outputs.installer }}"
+          $fetched = "${{ steps.fetch.outputs.installer }}"
+          $exe = if ($fetched) { $fetched } else { $built }
+          if (-not $exe) { Write-Error "No installer: nothing was built and nothing was downloaded."; exit 1 }
+          Write-Host "Installer under test: $exe"
+          "installer=$exe" >> $env:GITHUB_OUTPUT
+
+      # NOT run when verifying a downloaded package: re-signing would rewrite the exact bytes the
+      # run exists to check, and the artifact at a submission URL is already signed.
       - name: Sign the installer (Azure Trusted Signing)
-        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        if: ${{ inputs.package_url == '' && env.AZURE_CLIENT_ID != '' }}
         uses: azure/trusted-signing-action@v0
         with:
           azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
@@ -296,7 +354,7 @@ jobs:
           certificate-profile-name: mlc-public-trust
           # MUST be absolute. The signing client rejects a relative path outright with
           # "The file path '...' is not rooted."
-          files: ${{ steps.find.outputs.installer }}
+          files: ${{ steps.installed_pkg.outputs.installer }}
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
@@ -308,7 +366,7 @@ jobs:
         if: ${{ env.AZURE_CLIENT_ID != '' }}
         shell: pwsh
         run: |
-          $sig = Get-AuthenticodeSignature "${{ steps.find.outputs.installer }}"
+          $sig = Get-AuthenticodeSignature "${{ steps.installed_pkg.outputs.installer }}"
           Write-Host "Status:        $($sig.Status)"
           Write-Host "Signer:        $($sig.SignerCertificate.Subject)"
           Write-Host "Timestamp:     $($sig.TimeStamperCertificate.Subject)"
@@ -352,7 +410,7 @@ jobs:
           "params=$params" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
           Write-Host "Silent install parameters: $params"
-          $p = Start-Process "${{ steps.find.outputs.installer }}" -PassThru
+          $p = Start-Process "${{ steps.installed_pkg.outputs.installer }}" -PassThru
           $exited = $p.WaitForExit(90000)
           if (-not $exited) {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
@@ -384,7 +442,7 @@ jobs:
           # prints for Partner Center. Hardcoding them here is what let CI and the submission drift.
           $declared = (Get-Content "tools/windows-store-install-parameters.txt" -Raw).Trim() -split '\s+'
           Write-Host "Installing with the DECLARED parameters: $($declared -join ' ')"
-          $p = Start-Process "${{ steps.find.outputs.installer }}" -Wait -PassThru -ArgumentList (
+          $p = Start-Process "${{ steps.installed_pkg.outputs.installer }}" -Wait -PassThru -ArgumentList (
             $declared + @("/log", "`"$log`""))
           Write-Host "Installer exit code: $($p.ExitCode)"
           # 3010 is "success, reboot required", which is still a successful install.
@@ -407,7 +465,7 @@ jobs:
       - name: Measure the installer's return codes
         shell: pwsh
         run: |
-          $installer = "${{ steps.find.outputs.installer }}"
+          $installer = "${{ steps.installed_pkg.outputs.installer }}"
           $declared = (Get-Content "tools/windows-store-install-parameters.txt" -Raw).Trim() -split '\s+'
           $results = @()
 
@@ -514,7 +572,7 @@ jobs:
             # Excludes the installer itself: it is also a .exe and Burn caches a copy on disk,
             # so without this the gate could launch the installer and call that a running app.
             $f = Get-ChildItem -Path $r -Recurse -Filter "Reveal the Dream.exe" -ErrorAction SilentlyContinue |
-                 Where-Object { $_.FullName -ne "${{ steps.find.outputs.installer }}" } |
+                 Where-Object { $_.FullName -ne "${{ steps.installed_pkg.outputs.installer }}" } |
                  Select-Object -First 1
             if ($f) { $exe = $f.FullName; break }
           }
@@ -714,7 +772,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $installer = "${{ steps.find.outputs.installer }}"
+          $installer = "${{ steps.installed_pkg.outputs.installer }}"
           gh release upload latest "$installer" --clobber --repo ${{ github.repository }}
           Write-Host "Published $(Split-Path $installer -Leaf)"
 
