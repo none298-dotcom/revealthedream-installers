@@ -322,61 +322,70 @@ jobs:
       # rather than through msiexec, and its silent switch is /quiet. Getting this wrong does not
       # error: the wrong switch opens the INTERACTIVE installer on a machine with nobody at the
       # keyboard, and the job hangs until it times out.
-      # THE STORE DOES NOT PASS OUR SWITCHES. This step runs the installer the way a Microsoft
-      # certifier's harness does when the submission declares no silent parameters: bare, with no
-      # arguments at all, unattended.
+      # THE STORE ONLY PASSES WHAT THE SUBMISSION DECLARES.
       #
-      # Added 2026-08-06 after Microsoft rejected the submission under 10.3.4 "App Is Testable" with
-      # "The product failed to install through the Store ... Notice it loads indefinitely and cannot
-      # complete the installation."
+      # Microsoft rejected this app on 2026-08-06 under 10.3.4 "App Is Testable": "The product
+      # failed to install through the Store ... Notice it loads indefinitely and cannot complete the
+      # installation."
       #
-      # The step below this one has always passed, and it always will, because it hands the
-      # installer `/quiet`. That proves OUR install command works. It says nothing about the
-      # command the Store issues, and the comment on that step already spelled out the exact
-      # consequence without anyone connecting it to certification: "the wrong switch opens the
-      # INTERACTIVE installer on a machine with nobody at the keyboard, and the job hangs until it
-      # times out". That is Microsoft's sentence, in our own repository, months early.
+      # Every install gate here was green and none of them could have caught it, because every one
+      # of them passed `/quiet` itself. That proves OUR install command works and says nothing about
+      # the command the Store issues. Reproducing it took one run: started bare, the installer was
+      # still sitting there two minutes later. The comment on the step below had described that
+      # exact outcome for months without anyone connecting it to certification.
       #
-      # This is the same lesson as the per-machine assertion below and as AGENTS.md's rule about
-      # testing the PACKAGE rather than the working copy, one level further out: it is not enough to
-      # install the shipped artifact, it has to be installed the way the shipping CHANNEL installs
-      # it.
+      # A bare install hanging is NOT a bug, which is why this step does not fail on it. An
+      # interactive installer is supposed to wait for a human, and making it silent by default would
+      # mean someone downloading the exe from the website gets no wizard and no say in where it
+      # goes. The installer was right. The submission was incomplete.
       #
-      # A hang is the failure. So the assertion is on the clock, not on an exit code.
-      - name: Prove a bare, unattended install cannot hang
+      # So the assertion that matters is the one below: the switches CI proves are the switches the
+      # submission declares, read from ONE file rather than written down twice. This step exists to
+      # print that string where whoever fills in the form will see it, and to say plainly whether
+      # the parameters are optional or mandatory for this build.
+      - name: Report the silent install contract
+        id: installparams
         shell: pwsh
         run: |
-          $installer = "${{ steps.find.outputs.installer }}"
-          Write-Host "Running with NO arguments, exactly as an undeclared Store install would."
-          $p = Start-Process $installer -PassThru
-          $finished = $p.WaitForExit(120000)
-          if (-not $finished) {
-            # Leave nothing behind for the real install step, and make the diagnosis explicit rather
-            # than leaving a maintainer to infer it from a timeout.
+          $params = (Get-Content "tools/windows-store-install-parameters.txt" -Raw).Trim()
+          if (-not $params) { Write-Error "tools/windows-store-install-parameters.txt is empty."; exit 1 }
+          "params=$params" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          Write-Host "Silent install parameters: $params"
+          $p = Start-Process "${{ steps.find.outputs.installer }}" -PassThru
+          $exited = $p.WaitForExit(90000)
+          if (-not $exited) {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-            Get-Process -Name "*Reveal*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Write-Host ""
-            Write-Host "REPRODUCED THE MICROSOFT REJECTION."
-            Write-Host "With no arguments this installer waits for a human forever, which is exactly"
-            Write-Host "what a certifier sees as 'it loads indefinitely and cannot complete'."
-            Write-Host ""
-            Write-Host "This is NOT necessarily a bug in the installer. It is what a WiX Burn"
-            Write-Host "bootstrapper is supposed to do when nobody asked it to be quiet. The fix is"
-            Write-Host "to declare the silent parameters on the package in Partner Center, so the"
-            Write-Host "Store passes them. Our own value is: /quiet /norestart"
-            Write-Error "A bare install hangs. Declare silent install parameters in Partner Center, or ship an installer that is silent by default."
-            exit 1
+            $verdict = "MANDATORY. Run bare, this installer waits for a human forever."
+          } else {
+            $verdict = "Optional for installing, but declare them anyway. Bare run exited $($p.ExitCode)."
           }
-          Write-Host "Bare install exited with $($p.ExitCode) inside the timeout, so it does not hang."
-          Write-Host "NOTE: exiting is necessary but not sufficient. A non-zero code here still means"
-          Write-Host "a certifier's bare install fails, just quickly rather than forever."
+
+          $summary = @(
+            "## Microsoft Partner Center: install parameters",
+            "",
+            "Packages -> install parameters must contain exactly:",
+            "",
+            '```',
+            $params,
+            '```',
+            "",
+            "Status for this build: $verdict",
+            "",
+            "Leaving that field blank is what caused the 2026-08-06 rejection.")
+          $summary -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Write-Host $verdict
 
       - name: Silent install
         shell: pwsh
         run: |
           $log = "$env:RUNNER_TEMP\install.log"
-          $p = Start-Process "${{ steps.find.outputs.installer }}" -Wait -PassThru -ArgumentList @(
-            "/quiet", "/norestart", "/log", "`"$log`"")
+          # Split from tools/windows-store-install-parameters.txt, the same file the step above
+          # prints for Partner Center. Hardcoding them here is what let CI and the submission drift.
+          $declared = (Get-Content "tools/windows-store-install-parameters.txt" -Raw).Trim() -split '\s+'
+          Write-Host "Installing with the DECLARED parameters: $($declared -join ' ')"
+          $p = Start-Process "${{ steps.find.outputs.installer }}" -Wait -PassThru -ArgumentList (
+            $declared + @("/log", "`"$log`""))
           Write-Host "Installer exit code: $($p.ExitCode)"
           # 3010 is "success, reboot required", which is still a successful install.
           if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
