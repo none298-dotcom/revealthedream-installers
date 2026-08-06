@@ -536,6 +536,23 @@ jobs:
       # A failure here stops the publish steps below. That is on purpose. The alternative is a job
       # that goes green having produced nothing usable, and a gate that cannot fail is the worst
       # kind. Turn the `screenshots` input off to publish an installer without them.
+      - name: Shoot Microsoft Store screenshots
+        if: ${{ inputs.screenshots }}
+        shell: pwsh
+        run: |
+          ./tools/windows-store-screenshots.ps1 `
+            -InstalledExe "${{ steps.installed.outputs.exe }}" `
+            -RepoRoot "${{ github.workspace }}" `
+            -OutputDir "$env:RUNNER_TEMP\store-screenshots"
+
+      - name: Upload the store screenshots
+        if: ${{ inputs.screenshots }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: microsoft-store-screenshots
+          path: ${{ runner.temp }}/store-screenshots/*.png
+          if-no-files-found: error
+
       # Presses a button. Everything above this asserts the app is signed, installed correctly and
       # showing a window; none of it exercises a control, so a dead button passes all of it. The
       # sibling project's Windows test asserted exactly that much and stayed green through two
@@ -557,23 +574,6 @@ jobs:
             ${{ runner.temp }}/click-before.png
             ${{ runner.temp }}/click-after.png
           if-no-files-found: warn
-
-      - name: Shoot Microsoft Store screenshots
-        if: ${{ inputs.screenshots }}
-        shell: pwsh
-        run: |
-          ./tools/windows-store-screenshots.ps1 `
-            -InstalledExe "${{ steps.installed.outputs.exe }}" `
-            -RepoRoot "${{ github.workspace }}" `
-            -OutputDir "$env:RUNNER_TEMP\store-screenshots"
-
-      - name: Upload the store screenshots
-        if: ${{ inputs.screenshots }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: microsoft-store-screenshots
-          path: ${{ runner.temp }}/store-screenshots/*.png
-          if-no-files-found: error
 
       - name: Upload evidence
         if: always()
