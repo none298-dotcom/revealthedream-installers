@@ -516,21 +516,51 @@ jobs:
         shell: pwsh
         run: |
           $declared = (Get-Content "tools/windows-store-install-parameters.txt" -Raw).Trim()
-          $log = "$env:RUNNER_TEMP\install.log"
           $installer = "${{ steps.installed_pkg.outputs.installer }}"
-          Write-Host "Installing UNELEVATED with the DECLARED parameters: $declared"
-          cmd /c "runas /trustlevel:0x20000 `"`"$installer`" $declared /log `"$log`"`""
 
-          # The child is detached from runas, so wait for it to finish rather than racing the
-          # assertions below.
+          # Verbose Windows Installer logging by policy, so a failure leaves an explanation rather
+          # than a number. Passing /log through runas instead would mean nesting a third level of
+          # quotes, which is what broke the first version of this step.
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Force | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Name "Logging" -Value "voicewarmupx"
+          Get-ChildItem $env:TEMP -Filter "MSI*.LOG" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+
+          # The command goes in a .cmd file rather than inline. runas takes ONE quoted string, the
+          # installer path contains spaces, and the whole thing then passes through cmd /c, so an
+          # inline version needs three nested levels of quoting and got it wrong. A file has none.
+          $cmdFile = Join-Path $env:RUNNER_TEMP "install-unelevated.cmd"
+          Set-Content -Path $cmdFile -Value "`"$installer`" $declared" -Encoding ASCII
+          Write-Host "Command file contains: $(Get-Content $cmdFile)"
+
+          Write-Host "Installing UNELEVATED (administrator token stripped)..."
+          $out = cmd /c "runas /trustlevel:0x20000 `"$cmdFile`" 2>&1"
+          $out | ForEach-Object { Write-Host "  $_" }
+
+          # runas reports on ITSELF, not on the installer, and it returns as soon as the child is
+          # launched. So neither its exit code nor this wait is the verdict: the assertion step below
+          # judges the install by what actually landed on disk and in the registry.
           $deadline = (Get-Date).AddMinutes(4)
           do {
             Start-Sleep -Seconds 5
-            $busy = Get-Process -ErrorAction SilentlyContinue |
-                    Where-Object { $_.ProcessName -match "msiexec|Reveal" -and $_.ProcessName -ne "RevealTheDream" }
-          } while ($busy -and (Get-Date) -lt $deadline)
+            $busy = @(Get-Process -Name "msiexec" -ErrorAction SilentlyContinue)
+          } while ($busy.Count -gt 0 -and (Get-Date) -lt $deadline)
           Start-Sleep -Seconds 10
-          if (Test-Path $log) { Get-Content $log -Tail 15 }
+
+          $log = Get-ChildItem $env:TEMP -Filter "MSI*.LOG" -ErrorAction SilentlyContinue |
+                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($log) {
+            Write-Host ""
+            Write-Host "=== Windows Installer log, the lines that say what happened ==="
+            Get-Content $log.FullName |
+              Select-String -Pattern "MSI_LUA|MainEngineThread is returning|Return value 3|Product: |Installation success|Installation failed" |
+              Select-Object -Last 12 | ForEach-Object { Write-Host "  $($_.Line)" }
+          } else {
+            Write-Host "No MSI log appeared, so the failure was before the engine started."
+          }
+
+          # Explicit, because GitHub's pwsh wrapper exits on whatever $LASTEXITCODE happens to hold
+          # and runas's code is about runas. Failing here would pre-empt the assertion that matters.
+          exit 0
 
       # ASSERT WHAT MICROSOFT CERTIFICATION ASSERTS, for the scope this package actually uses.
       #
