@@ -434,6 +434,68 @@ jobs:
           $summary -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           Write-Host $verdict
 
+      # WHY 1603, which is what the second Microsoft rejection reported.
+      #
+      # 1603 is ERROR_INSTALL_FAILURE, the MSI engine's generic "something went wrong". It carries no
+      # information by itself, so this step's whole job is to turn it into a real error message.
+      #
+      # The first rejection was a hang, fixed by declaring /quiet /norestart. The second got further:
+      # the installer ran silently and then failed. Meanwhile this exact binary, by SHA256, installs
+      # with exit code 0 on this runner. So the binary is not broken and the difference is the
+      # ENVIRONMENT, which leaves elevation as the first suspect: a GitHub runner is an administrator
+      # with UAC out of the way, and a certifier's Surface Laptop is not.
+      #
+      # docs/windows-store-certification.md already predicted this shape: "Per-machine needs
+      # elevation. A silent install that cannot elevate must FAIL rather than quietly fall back to
+      # per-user." This app installs per-machine on purpose, because the sibling project was rejected
+      # twice for a per-user install whose shortcut and uninstall entry a certifier could not see.
+      #
+      # So this reproduces the unelevated case deliberately, with the Windows Installer logging policy
+      # turned on first so the failure leaves a readable log instead of a number. It does NOT fail the
+      # build: it is a diagnosis, and the elevated install below is still the gate.
+      - name: Diagnose 1603, by installing the way a non-admin would
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          # voicewarmupx is the full verbose set. Turning it on by policy catches every MSI action on
+          # the machine, which matters because the failure is inside the MSI our exe unpacks and
+          # hands off, not in the exe itself.
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Force | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Name "Logging" -Value "voicewarmupx"
+          Get-ChildItem $env:TEMP -Filter "MSI*.LOG" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+
+          $installer = "${{ steps.installed_pkg.outputs.installer }}"
+          $declared = (Get-Content "tools/windows-store-install-parameters.txt" -Raw).Trim()
+
+          # /trustlevel:0x20000 is "Basic User": the same process, stripped of the administrator
+          # token. It needs no password, unlike runas with a real account, so it works on a runner.
+          Write-Host "Installing WITHOUT elevation..."
+          $cmd = "runas /trustlevel:0x20000 `"`"$installer`" $declared`""
+          cmd /c $cmd
+          Write-Host "runas returned: $LASTEXITCODE"
+          Start-Sleep -Seconds 45
+
+          Write-Host ""
+          Write-Host "=== Windows Installer log, the lines that actually say what failed ==="
+          $log = Get-ChildItem $env:TEMP -Filter "MSI*.LOG" -ErrorAction SilentlyContinue |
+                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $log) {
+            Write-Host "No MSI log was produced. That itself is a finding: the failure happened"
+            Write-Host "BEFORE the MSI engine started, so it is in the exe wrapper, not the package."
+          } else {
+            Write-Host "Log: $($log.FullName)"
+            # "Return value 3" is how an MSI action reports failure, and the line above it names the
+            # action. Everything else in a verbose log is noise for this purpose.
+            $lines = Get-Content $log.FullName
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match "Return value 3|Error 1[0-9]{3}|MainEngineThread is returning|cannot access|Access is denied|elevat") {
+                $from = [Math]::Max(0, $i - 3)
+                $lines[$from..$i] | ForEach-Object { Write-Host "  $_" }
+                Write-Host "  ---"
+              }
+            }
+          }
+
       - name: Silent install
         shell: pwsh
         run: |
