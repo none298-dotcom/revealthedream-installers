@@ -546,17 +546,37 @@ jobs:
           } while ($busy.Count -gt 0 -and (Get-Date) -lt $deadline)
           Start-Sleep -Seconds 10
 
-          $log = Get-ChildItem $env:TEMP -Filter "MSI*.LOG" -ErrorAction SilentlyContinue |
-                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if ($log) {
+          function Show-MsiLog($label) {
+            $log = Get-ChildItem $env:TEMP -Filter "MSI*.LOG" -ErrorAction SilentlyContinue |
+                   Sort-Object LastWriteTime -Descending | Select-Object -First 1
             Write-Host ""
-            Write-Host "=== Windows Installer log, the lines that say what happened ==="
+            Write-Host "=== $label ==="
+            if (-not $log) { Write-Host "  No MSI log: the failure was before the engine started."; return }
+            # ALLUSERS and MSIINSTALLPERUSER are what decide the install CONTEXT. A jpackage
+            # per-user package is dual-purpose (ALLUSERS=2), which resolves to per-machine unless
+            # MSIINSTALLPERUSER is set, and per-machine is what cannot run without elevation.
             Get-Content $log.FullName |
-              Select-String -Pattern "MSI_LUA|MainEngineThread is returning|Return value 3|Product: |Installation success|Installation failed" |
-              Select-Object -Last 12 | ForEach-Object { Write-Host "  $($_.Line)" }
-          } else {
-            Write-Host "No MSI log appeared, so the failure was before the engine started."
+              Select-String -Pattern "MSI_LUA|MainEngineThread is returning|Installation success|Property\(S\): ALLUSERS|Property\(C\): ALLUSERS|MSIINSTALLPERUSER|INSTALLDIR = |Doing action: |per-user|per-machine" |
+              Select-Object -Last 25 | ForEach-Object { Write-Host "  $($_.Line)" }
           }
+          Show-MsiLog "Attempt 1: the declared parameters only"
+
+          # EXPERIMENT, in the same run, because another whole cycle to test one property is waste.
+          # If a dual-purpose package is defaulting to per-machine, forcing the per-user context is
+          # the difference between 1625 and a clean install, and this says so in one attempt.
+          Write-Host ""
+          Write-Host "Attempt 2: same thing, forcing the per-user context explicitly"
+          Get-ChildItem $env:TEMP -Filter "MSI*.LOG" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+          $cmdFile2 = Join-Path $env:RUNNER_TEMP "install-unelevated-peruser.cmd"
+          Set-Content -Path $cmdFile2 -Value "`"$installer`" $declared MSIINSTALLPERUSER=1 ALLUSERS=2" -Encoding ASCII
+          Write-Host "  Command file contains: $(Get-Content $cmdFile2)"
+          $out2 = cmd /c "runas /trustlevel:0x20000 `"$cmdFile2`" 2>&1"
+          $out2 | ForEach-Object { Write-Host "  $_" }
+          $deadline2 = (Get-Date).AddMinutes(4)
+          do { Start-Sleep -Seconds 5; $busy2 = @(Get-Process -Name "msiexec" -ErrorAction SilentlyContinue) }
+          while ($busy2.Count -gt 0 -and (Get-Date) -lt $deadline2)
+          Start-Sleep -Seconds 10
+          Show-MsiLog "Attempt 2: with MSIINSTALLPERUSER=1"
 
           # Explicit, because GitHub's pwsh wrapper exits on whatever $LASTEXITCODE happens to hold
           # and runas's code is about runas. Failing here would pre-empt the assertion that matters.
