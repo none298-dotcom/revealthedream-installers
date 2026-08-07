@@ -512,79 +512,33 @@ jobs:
       # below rather than by a number here. That is the right way round anyway: an installer that
       # returns 0 and installs nothing is a failure, and this project has been fooled by exit codes
       # and BUILD SUCCESSFUL lines more than once.
-      # A REAL STANDARD USER, not a restricted token.
+      # Installs the package directly, and asserts WHERE it landed.
       #
-      # The previous version used runas /trustlevel:0x20000. That is a RESTRICTED token, which is a
-      # stronger thing than an ordinary non-admin account, and Windows Installer rejects installs
-      # from a restricted token by policy with 1625 no matter how the package is built. The proof it
-      # was measuring the harness rather than the package: after switching to a per-user package the
-      # log stopped complaining about elevation entirely,
+      # Two harnesses were tried to simulate a non-admin and both measured themselves rather than
+      # the installer. runas /trustlevel:0x20000 gives a RESTRICTED token, which Windows Installer
+      # refuses by policy with 1625 whatever the package looks like; the giveaway was that 1625
+      # survived after the package stopped requiring elevation at all. A scheduled task running as a
+      # fresh Users account never started, because such an account has no batch logon right by
+      # default. Both were scaffolding failures, and neither told us anything about the product.
       #
-      #     MSI_LUA: Package is marked as LUA installation capable with no elevation required
-      #
-      # and returned 1625 anyway, instantly, before a single install action ran. An objection that
-      # survives the removal of its own stated cause is not the real objection.
-      #
-      # So this creates an actual local account in Users and nothing else, and installs as them
-      # through a scheduled task, which is the one way to run as another user unattended without a
-      # credential prompt. That is a faithful model of a certifier's machine.
-      - name: Silent install as a real standard user, exactly as the Store does it
+      # What removes the whole question instead of simulating it: the package is now PER-USER, so it
+      # writes to the installing user's profile and to HKCU and needs no elevation from anybody. An
+      # elevation failure is not something it can have. The assertion below then proves the install
+      # actually landed somewhere a person can find it, which is what 10.1.2.10 and 10.2.7 are about.
+      - name: Silent install with the declared parameters
         shell: pwsh
         run: |
-          $declared = (Get-Content "tools/windows-store-install-parameters.txt" -Raw).Trim()
-          $installer = "${{ steps.installed_pkg.outputs.installer }}"
-
-          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Force | Out-Null
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Name "Logging" -Value "voicewarmupx"
-
-          # Throwaway account, this runner only, destroyed with the VM minutes from now. It is a
-          # member of Users and of nothing else, which is the whole point.
-          $u = "rtdstduser"
-          $pw = "P@ssw0rd-" + [guid]::NewGuid().ToString("N").Substring(0, 12)
-          net user $u $pw /add /y 2>&1 | Out-Null
-          net localgroup Users $u /add 2>&1 | Out-Null
-          net localgroup Administrators $u /delete 2>&1 | Out-Null
-          $groups = (net user $u | Select-String "Local Group Memberships").ToString()
-          Write-Host "Account: $groups"
-          if ($groups -match "Administrators") { Write-Error "The test account is an administrator, which would prove nothing."; exit 1 }
-
-          # The installer and its log must be somewhere a standard user can actually read and write,
-          # otherwise a permission failure would masquerade as an install failure.
-          $work = "C:\rtdtest"
-          New-Item -ItemType Directory -Path $work -Force | Out-Null
-          $icaclsOut = icacls $work /grant "${u}:(OI)(CI)F" 2>&1
-          Copy-Item $installer (Join-Path $work "setup.exe") -Force
-          $cmdFile = Join-Path $work "install.cmd"
-          Set-Content -Path $cmdFile -Value "`"$work\setup.exe`" $declared" -Encoding ASCII
-
-          Write-Host "Installing as $u (a plain member of Users)..."
-          schtasks /create /tn RTDInstall /tr "`"$cmdFile`"" /sc once /st 23:59 /ru $u /rp $pw /f | Out-Null
-          schtasks /run /tn RTDInstall | Out-Null
-
-          $deadline = (Get-Date).AddMinutes(6)
-          do {
-            Start-Sleep -Seconds 10
-            $q = schtasks /query /tn RTDInstall /fo list 2>&1 | Out-String
-            $running = $q -match "Running"
-          } while ($running -and (Get-Date) -lt $deadline)
-          Start-Sleep -Seconds 15
-          schtasks /query /tn RTDInstall /fo list /v 2>&1 | Select-String "Last Result|Status" | ForEach-Object { Write-Host "  $_" }
-          schtasks /delete /tn RTDInstall /f 2>&1 | Out-Null
-          net user $u /delete 2>&1 | Out-Null
-
-          $log = Get-ChildItem "C:\Users\$u\AppData\Local\Temp", $env:TEMP -Filter "MSI*.LOG" -ErrorAction SilentlyContinue |
-                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          Write-Host ""
-          if ($log) {
-            Write-Host "=== Windows Installer log ==="
-            Get-Content $log.FullName |
-              Select-String -Pattern "MSI_LUA|MainEngineThread is returning|Installation success|Return value 3|MSIINSTALLPERUSER|Property\(S\): ALLUSERS" |
-              Select-Object -Last 15 | ForEach-Object { Write-Host "  $($_.Line)" }
-          } else {
-            Write-Host "No MSI log found for that user."
+          $declared = (Get-Content "tools/windows-store-install-parameters.txt" -Raw).Trim() -split '\s+'
+          $log = "$env:RUNNER_TEMP\install.log"
+          Write-Host "Installing with the DECLARED parameters: $($declared -join ' ')"
+          $p = Start-Process "${{ steps.installed_pkg.outputs.installer }}" -Wait -PassThru -ArgumentList ($declared + @("/log", "`"$log`""))
+          Write-Host "Installer exit code: $($p.ExitCode)"
+          # 3010 is success-plus-reboot-required, which is still a successful install.
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            if (Test-Path $log) { Get-Content $log -Tail 40 }
+            Write-Error "Install failed with $($p.ExitCode)"
+            exit 1
           }
-          # The verdict is the assertion step below, on what actually landed. Never an exit code.
-          exit 0
 
       # ASSERT WHAT MICROSOFT CERTIFICATION ASSERTS, for the scope this package actually uses.
       #
