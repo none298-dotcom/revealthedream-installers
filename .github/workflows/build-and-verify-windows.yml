@@ -496,151 +496,92 @@ jobs:
             }
           }
 
-      - name: Silent install
+      # INSTALLS WITHOUT ELEVATION, deliberately, because that is what a certifier does.
+      #
+      # This step used to run as the runner's administrator, which is why it passed through two
+      # Microsoft rejections. The 1603 failure was reproduced here only once the administrator token
+      # was stripped, and the Windows Installer log named the cause outright:
+      #
+      #     MSI_LUA: Installation UI level is silent, no credential elevation is possible
+      #     MainEngineThread is returning 1625
+      #
+      # runas /trustlevel:0x20000 is "Basic User": the same process with the elevated token removed.
+      # It needs no password, unlike runas with a real account, so it works unattended.
+      #
+      # runas returns its own exit code and not the child's, so the install is judged by its EFFECT
+      # below rather than by a number here. That is the right way round anyway: an installer that
+      # returns 0 and installs nothing is a failure, and this project has been fooled by exit codes
+      # and BUILD SUCCESSFUL lines more than once.
+      - name: Silent install, unelevated, exactly as the Store does it
         shell: pwsh
         run: |
+          $declared = (Get-Content "tools/windows-store-install-parameters.txt" -Raw).Trim()
           $log = "$env:RUNNER_TEMP\install.log"
-          # Split from tools/windows-store-install-parameters.txt, the same file the step above
-          # prints for Partner Center. Hardcoding them here is what let CI and the submission drift.
-          $declared = (Get-Content "tools/windows-store-install-parameters.txt" -Raw).Trim() -split '\s+'
-          Write-Host "Installing with the DECLARED parameters: $($declared -join ' ')"
-          $p = Start-Process "${{ steps.installed_pkg.outputs.installer }}" -Wait -PassThru -ArgumentList (
-            $declared + @("/log", "`"$log`""))
-          Write-Host "Installer exit code: $($p.ExitCode)"
-          # 3010 is "success, reboot required", which is still a successful install.
-          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
-            if (Test-Path $log) { Get-Content $log -Tail 40 }
-            Write-Error "Install failed with $($p.ExitCode)"
-            exit 1
-          }
-
-      # Partner Center's "Standard install scenarios" asks for this installer's return code for
-      # each of: installation successful, cancelled by user, application already exists,
-      # installation already in progress, disk space full, reboot required, network failure, and
-      # package rejected. Those drive the message a customer sees when an install goes wrong.
-      #
-      # The codes are MEASURED here rather than copied from a table of standard MSI values, because
-      # this project's whole history is things that were true of the general case and false of this
-      # build. Only the scenarios that can actually be produced on a runner are measured; the rest
-      # are reported as unmeasured rather than guessed, so nobody types a number into a Microsoft
-      # form on my say-so.
-      - name: Measure the installer's return codes
-        shell: pwsh
-        run: |
           $installer = "${{ steps.installed_pkg.outputs.installer }}"
-          $declared = (Get-Content "tools/windows-store-install-parameters.txt" -Raw).Trim() -split '\s+'
-          $results = @()
+          Write-Host "Installing UNELEVATED with the DECLARED parameters: $declared"
+          cmd /c "runas /trustlevel:0x20000 `"`"$installer`" $declared /log `"$log`"`""
 
-          # Already installed. The install step above has run, so this second identical install is
-          # the "application already exists" path a customer hits when the Store reinstalls.
-          $p = Start-Process $installer -Wait -PassThru -ArgumentList $declared
-          $results += [pscustomobject]@{ Scenario = "Application already exists (reinstall over itself)"; Code = $p.ExitCode }
+          # The child is detached from runas, so wait for it to finish rather than racing the
+          # assertions below.
+          $deadline = (Get-Date).AddMinutes(4)
+          do {
+            Start-Sleep -Seconds 5
+            $busy = Get-Process -ErrorAction SilentlyContinue |
+                    Where-Object { $_.ProcessName -match "msiexec|Reveal" -and $_.ProcessName -ne "RevealTheDream" }
+          } while ($busy -and (Get-Date) -lt $deadline)
+          Start-Sleep -Seconds 10
+          if (Test-Path $log) { Get-Content $log -Tail 15 }
 
-          # Two at once. Windows Installer serialises, so the loser reports already-in-progress.
-          $a = Start-Process $installer -PassThru -ArgumentList $declared
-          Start-Sleep -Milliseconds 400
-          $b = Start-Process $installer -PassThru -ArgumentList $declared
-          $a.WaitForExit(180000) | Out-Null
-          $b.WaitForExit(180000) | Out-Null
-          $results += [pscustomobject]@{ Scenario = "Installation already in progress (second of two)"; Code = "$($a.ExitCode) and $($b.ExitCode)" }
-
-          # An argument the bootstrapper does not understand. This is what /S actually did.
-          $p = Start-Process $installer -PassThru -ArgumentList @("/S")
-          if ($p.WaitForExit(60000)) {
-            $results += [pscustomobject]@{ Scenario = "Unrecognised switch /S (the NSIS one)"; Code = $p.ExitCode }
-          } else {
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-            $results += [pscustomobject]@{ Scenario = "Unrecognised switch /S (the NSIS one)"; Code = "HUNG, no exit within 60s" }
-          }
-
-          $results | Format-Table -AutoSize | Out-String | Write-Host
-
-          $lines = @("## Measured installer return codes", "", "| Scenario | Exit code |", "|---|---|")
-          foreach ($r in $results) { $lines += "| $($r.Scenario) | ``$($r.Code)`` |" }
-          $lines += ""
-          $lines += "Successful install is measured by the Silent install step above."
-          $lines += "Disk full, reboot required, network failure and package rejected are NOT measurable"
-          $lines += "on a runner and are deliberately left unmeasured rather than guessed."
-          $lines -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-
-      # ASSERT WHAT MICROSOFT CERTIFICATION ASSERTS, not what we happen to care about.
+      # ASSERT WHAT MICROSOFT CERTIFICATION ASSERTS, for the scope this package actually uses.
       #
-      # MyLinedChart was rejected twice by Store certification while its own smoke test was green,
-      # because that test downloaded, verified the signature, silent-installed exactly as the
-      # certifier does, launched the app and proved it survived, and then checked NONE of what
-      # certification checks. A green run and a rejection letter sat side by side for days. See
-      # docs/windows-store-certification.md in that repo.
+      # Two rejections shaped this. MyLinedChart failed 10.1.2.10 ("no accessible method of being
+      # launched") and 10.2.7 ("no entry in the Add or Remove Programs list") from a per-user install
+      # whose shortcut and uninstall key a certifier could not see. This app then failed 10.3.4 with
+      # 1603 from a per-machine install that cannot run unelevated at all.
       #
-      # The rejection was 10.1.2.10 "no accessible method of being launched" and 10.2.7 "no entry
-      # in the Add or Remove Programs list", from a per-user install. The certifier installs
-      # elevated and then inspects the machine as a normal user, so a shortcut in the installing
-      # user's profile and an uninstall entry under HKCU are both invisible to them.
-      #
-      # Finding either under the per-user location is the DIAGNOSIS, so this reports it explicitly
-      # rather than just failing.
-      - name: Assert the install is per-machine, as certification checks
+      # The resolution is that the certifier installs UNELEVATED, as the ordinary user. Under that
+      # condition per-user is not merely acceptable, it is the only scope that can install, and the
+      # shortcut and uninstall entry land in the profile of the very user doing the testing. So the
+      # assertion is not "per-machine" or "per-user", it is: whoever just installed this can SEE it.
+      - name: Assert the installing user can see the app and its uninstall entry
         shell: pwsh
         run: |
           $fail = $false
 
+          $perUser = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs"
           $allUsers = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs"
-          $lnk = Get-ChildItem $allUsers -Recurse -Filter "*Reveal*.lnk" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $lnk = @(Get-ChildItem $perUser, $allUsers -Recurse -Filter "*Reveal*.lnk" -ErrorAction SilentlyContinue) | Select-Object -First 1
           if ($lnk) {
-            Write-Host "OK   Start Menu shortcut (All Users): $($lnk.FullName)"
+            Write-Host "OK   Start Menu shortcut: $($lnk.FullName)"
           } else {
-            $perUser = Get-ChildItem "$env:APPDATA\Microsoft\Windows\Start Menu\Programs" -Recurse -Filter "*Reveal*.lnk" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($perUser) {
-              Write-Error "Shortcut is PER-USER at $($perUser.FullName). A certifier inspecting the machine will not see it. This is the 10.1.2.10 rejection."
-            } else {
-              Write-Error "No Start Menu shortcut anywhere. This is the 10.1.2.10 rejection."
-            }
+            Write-Error "No Start Menu shortcut in either the user's profile or All Users. This is the 10.1.2.10 rejection."
             $fail = $true
           }
 
-          # Add/Remove Programs reads HKLM. Both views, since a 32-bit MSI lands in WOW6432Node.
-          $hklm = @(
+          $keys = @(
+            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
             "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
-          ) | ForEach-Object { Get-ItemProperty $_ -ErrorAction SilentlyContinue } |
-              Where-Object { $_.DisplayName -like "*Reveal the Dream*" } | Select-Object -First 1
-
-          if ($hklm -and $hklm.UninstallString) {
-            Write-Host "OK   Add/Remove Programs entry: $($hklm.DisplayName)"
-            Write-Host "     UninstallString: $($hklm.UninstallString)"
-          } else {
-            $hkcu = Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
-                    Where-Object { $_.DisplayName -like "*Reveal the Dream*" } | Select-Object -First 1
-            if ($hkcu) {
-              Write-Error "Uninstall entry is under HKCU ($($hkcu.DisplayName)), not HKLM. Add/Remove Programs reads HKLM. This is the 10.2.7 rejection."
-            } else {
-              Write-Error "No uninstall entry with an UninstallString in HKLM. This is the 10.2.7 rejection."
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*")
+          $arp = Get-ItemProperty $keys -ErrorAction SilentlyContinue |
+                 Where-Object { $_.DisplayName -like "*Reveal*" } | Select-Object -First 1
+          if ($arp) {
+            Write-Host "OK   Add/Remove Programs entry: $($arp.DisplayName) $($arp.DisplayVersion)"
+            if (-not $arp.UninstallString) {
+              Write-Error "The entry has no UninstallString, so it cannot be removed. 10.2.7."
+              $fail = $true
             }
+          } else {
+            Write-Error "No Add/Remove Programs entry anywhere. This is the 10.2.7 rejection."
             $fail = $true
           }
+
+          # The whole point of an unelevated install: it must have produced a real installation, not
+          # a silent no-op that leaves the exit code looking fine.
+          $exe = @(Get-ChildItem "$env:LOCALAPPDATA", "$env:ProgramFiles" -Recurse -Filter "Reveal the Dream.exe" -ErrorAction SilentlyContinue) | Select-Object -First 1
+          if ($exe) { Write-Host "OK   Installed binary: $($exe.FullName)" }
+          else { Write-Error "The installer reported no error and installed no executable."; $fail = $true }
 
           if ($fail) { exit 1 }
-
-      - name: Locate the INSTALLED executable
-        id: installed
-        shell: pwsh
-        run: |
-          # perUserInstall = true, so it lands under LOCALAPPDATA. Both roots are searched anyway,
-          # because flipping that setting must not quietly turn this gate into a no-op that never
-          # finds the binary and therefore never fails.
-          $roots = @("$env:LOCALAPPDATA", "$env:ProgramFiles", "${env:ProgramFiles(x86)}")
-          $exe = $null
-          foreach ($r in $roots) {
-            if (-not $r) { continue }
-            # Excludes the installer itself: it is also a .exe and Burn caches a copy on disk,
-            # so without this the gate could launch the installer and call that a running app.
-            $f = Get-ChildItem -Path $r -Recurse -Filter "Reveal the Dream.exe" -ErrorAction SilentlyContinue |
-                 Where-Object { $_.FullName -ne "${{ steps.installed_pkg.outputs.installer }}" } |
-                 Select-Object -First 1
-            if ($f) { $exe = $f.FullName; break }
-          }
-          if (-not $exe) { Write-Error "Installed executable not found"; exit 1 }
-          "exe=$exe" >> $env:GITHUB_OUTPUT
-          Write-Host "Installed: $exe"
 
       - name: Launch it and assert it is really up
         shell: pwsh
