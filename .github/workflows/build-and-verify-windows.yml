@@ -591,6 +591,35 @@ jobs:
 
           if ($fail) { exit 1 }
 
+      # Finds the INSTALLED executable, in both places an install can put it.
+      #
+      # This step was accidentally deleted while rewriting the assertions around it, which is why the
+      # launch step then tried to Start-Process an empty path. Restored, and widened: a per-user
+      # install lands under %LOCALAPPDATA% and a per-machine one under Program Files, so looking in
+      # only one of them makes the whole downstream chain depend on a packaging choice it should not
+      # care about.
+      #
+      # Scoped to the app's own folder rather than a bare recursive search, because the app image
+      # also contains helper executables and picking one of those would launch nothing while looking
+      # like it worked.
+      - name: Locate the INSTALLED executable
+        id: installed
+        shell: pwsh
+        run: |
+          $roots = @("$env:LOCALAPPDATA", "$env:ProgramFiles", "${env:ProgramFiles(x86)}") | Where-Object { $_ -and (Test-Path $_) }
+          $found = @()
+          foreach ($r in $roots) {
+            $found += @(Get-ChildItem -Path $r -Filter "Reveal the Dream.exe" -Recurse -Depth 2 -ErrorAction SilentlyContinue)
+          }
+          if ($found.Count -lt 1) {
+            Write-Error "The app is installed but its executable was not found under $($roots -join ', ')."
+            exit 1
+          }
+          $exe = $found[0]
+          Write-Host "Installed executable: $($exe.FullName)"
+          Write-Host "Scope: $(if ($exe.FullName -like "$env:LOCALAPPDATA*") { 'per-user' } else { 'per-machine' })"
+          "exe=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+
       - name: Launch it and assert it is really up
         shell: pwsh
         run: |
