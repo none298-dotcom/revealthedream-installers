@@ -451,101 +451,6 @@ jobs:
       # explicitly silenced, so there is nothing on the stream to confuse.
       #
       # Never fails the build, and uninstalls itself so the Exe gates below see a clean machine.
-      # WHY DOES A PACKAGE WITH NO ALLUSERS REGISTER IN HKLM?
-      #
-      # Measured so far. The Exe and the Msi both put files in %LOCALAPPDATA% and both write their
-      # uninstall entry to HKLM, which needs an administrator, which is the rejection. Neither
-      # honours ALLUSERS=2 MSIINSTALLPERUSER=1 on the command line. And the Property table, read
-      # through the Windows Installer API, has NO ALLUSERS row at all, which Microsoft documents as
-      # meaning the per-user context.
-      #
-      # Deleting ALLUSERS was therefore a no-op and proved nothing. So the remaining candidate is
-      # that jpackage AUTHORS the uninstall entry itself, as an explicit Registry row rooted at
-      # HKLM, rather than letting Windows Installer place it according to the install context. That
-      # would explain every observation at once, and it would mean the fix is to re-root that row
-      # rather than to argue with ALLUSERS.
-      #
-      # This dumps the Registry table and asks Windows what context the product actually installed
-      # in, which is the authoritative answer rather than an inference from a key path.
-      #
-      # Every InvokeMember is piped to Out-Null: whatever a function leaves on the output stream IS
-      # its return value in PowerShell, and the first version of this step returned COM call results
-      # instead of rows. Same trap AGENTS.md records for Set-DisplayResolution.
-      #
-      # Never fails the build. Uninstalls itself so the Exe gates below see a clean machine.
-      - name: Why does the MSI register per-machine
-        if: ${{ inputs.package_url == '' }}
-        shell: pwsh
-        continue-on-error: true
-        working-directory: android
-        run: |
-          $found = @(Get-ChildItem -Recurse -Filter *.msi -Path desktop/build/compose/binaries/main/msi -ErrorAction SilentlyContinue)
-          if ($found.Count -ne 1) { Write-Host "Expected exactly one msi, found $($found.Count)."; exit 0 }
-          $src = $found[0].FullName
-          Write-Host "MSI: $src"
-
-          $msi = New-Object -ComObject WindowsInstaller.Installer
-
-          function Get-Table([string]$dbPath, [string]$sql, [int]$cols) {
-            $db = $msi.GetType().InvokeMember("OpenDatabase","InvokeMethod",$null,$msi,@($dbPath,0))
-            $vw = $db.GetType().InvokeMember("OpenView","InvokeMethod",$null,$db,@($sql))
-            $vw.GetType().InvokeMember("Execute","InvokeMethod",$null,$vw,$null) | Out-Null
-            $rows = [System.Collections.ArrayList]::new()
-            while ($true) {
-              $rec = $vw.GetType().InvokeMember("Fetch","InvokeMethod",$null,$vw,$null)
-              if ($null -eq $rec) { break }
-              $vals = @()
-              for ($i = 1; $i -le $cols; $i++) {
-                $vals += $rec.GetType().InvokeMember("StringData","GetProperty",$null,$rec,@($i))
-              }
-              $rows.Add($vals) | Out-Null
-            }
-            $vw.GetType().InvokeMember("Close","InvokeMethod",$null,$vw,$null) | Out-Null
-            ,$rows
-          }
-
-          Write-Host ""
-          Write-Host "--- Registry table rows (Root, Key, Name, Value) ---"
-          Write-Host "    Root: -1 = follows the install context, 1 = HKCU, 2 = HKLM"
-          try {
-            $reg = Get-Table $src "SELECT Root, Key, Name, Value FROM Registry" 4
-            Write-Host "    $($reg.Count) rows total"
-            foreach ($r in $reg) {
-              if ($r[1] -match "Uninstall" -or $r[0] -eq "2") {
-                Write-Host "     Root=$($r[0])  Key=$($r[1])"
-                Write-Host "        Name=$($r[2])  Value=$($r[3])"
-              }
-            }
-          } catch { Write-Host "    no Registry table, or it could not be read: $_" }
-
-          Write-Host ""
-          Write-Host "--- install it plainly, then ask Windows what context it used ---"
-          $p = Start-Process "msiexec.exe" -Wait -PassThru -ArgumentList @("/i","`"$src`"","/quiet","/norestart")
-          Write-Host "msiexec exit code: $($p.ExitCode)"
-
-          $code = "{EE760583-EF78-3B8E-9128-DC6DDFC07D6F}"
-          foreach ($prop in @("AssignmentType","InstallLocation","ProductName","PackageCode")) {
-            try {
-              $val = $msi.GetType().InvokeMember("ProductInfo","GetProperty",$null,$msi,@($code,$prop))
-              Write-Host "   $prop = $val"
-            } catch { Write-Host "   $prop = <unavailable>" }
-          }
-          Write-Host "   AssignmentType 0 = per-user, 1 = per-machine"
-
-          function Get-Arp([string]$hive) {
-            Get-ChildItem $hive -ErrorAction SilentlyContinue |
-              ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
-              Where-Object { $_.DisplayName -like "*Reveal*" }
-          }
-          $cu = @(Get-Arp "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")
-          $lm = @(Get-Arp "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")
-          Write-Host "   HKCU entries: $($cu.Count)   HKLM entries: $($lm.Count)"
-
-          foreach ($e in ($cu + $lm)) {
-            if ($e.PSChildName) { Start-Process "msiexec.exe" -Wait -ArgumentList @("/x",$e.PSChildName,"/quiet","/norestart") | Out-Null }
-          }
-          Start-Sleep -Seconds 5
-
       - name: Report the silent install contract
         id: installparams
         shell: pwsh
@@ -696,29 +601,28 @@ jobs:
       # condition per-user is not merely acceptable, it is the only scope that can install, and the
       # shortcut and uninstall entry land in the profile of the very user doing the testing. So the
       # assertion is not "per-machine" or "per-user", it is: whoever just installed this can SEE it.
-      # ASSERT THE SCOPE WE DECLARED, THEN SAY WHO CAN ACTUALLY RUN THE APP.
+      # ASK WINDOWS WHAT SCOPE IT INSTALLED IN. DO NOT INFER IT FROM A REGISTRY HIVE.
       #
-      # THIS IS THE HOLE THAT LET TWO REJECTIONS THROUGH. This job runs as an administrator, so it
-      # can install EITHER scope successfully, and the assertions here used to accept a shortcut in
-      # the user profile OR All Users, an uninstall key in HKCU OR HKLM, and a binary under
-      # %LOCALAPPDATA% OR Program Files. Whatever we shipped, it agreed. A gate that passes both
-      # answers to the question being asked is not testing that question.
+      # This gate exists because every earlier gate ran as the runner's administrator, the one
+      # condition a certifier never reproduces, and accepted a shortcut in the user profile OR All
+      # Users, an uninstall key in HKCU OR HKLM, and a binary in %LOCALAPPDATA% OR Program Files.
+      # Whatever we shipped, it agreed, through three rejections about scope.
       #
-      # Scope is not a packaging detail, it decides WHO CAN RUN THE APP:
-      #   per-machine  Program Files + HKLM. Every account on the PC sees it. Needs elevation.
-      #   per-user     %LOCALAPPDATA% + HKCU. ONLY the installing account sees it. Every other
-      #                account has no shortcut, no uninstall entry and no executable.
+      # ITS FIRST VERSION THEN MADE THE SAME CLASS OF MISTAKE, which is why the method is spelled
+      # out here. It read the uninstall entry's hive and called HKLM "per-machine", and reported a
+      # shipping bug that did not exist. On one install, on an administrator runner:
       #
-      # Microsoft rejected 1.3.1 under 10.1.2.10, "primary functionality for the product requires a
-      # Windows account with administrator privileges". That package CANNOT require elevation: its
-      # MSI sets the summary-information bit for "elevated privileges are not required", its exe
-      # manifest is asInvoker, and it installs here to %LOCALAPPDATA% with exit code 0. So the
-      # finding is not about elevation at all, it is about WHICH ACCOUNT HAS THE APP, and that is
-      # precisely what scope decides. The mirror image of the earlier per-machine rejection, where
-      # a certifier who could not elevate could not install it in the first place.
+      #     HKCU\...\Uninstall  -> nothing
+      #     HKLM\...\Uninstall  -> Reveal the Dream
+      #     files                -> C:\Users\<user>\AppData\Local\Reveal the Dream
+      #     AssignmentType       -> 0, which means PER-USER
       #
-      # So: intent lives in ONE place (build.gradle.kts), the installed artifact is measured against
-      # it, and the consequence for a second user is printed in plain words instead of inferred.
+      # msiexec puts the ARP entry in HKLM when an ADMINISTRATOR performs a per-user install. The
+      # hive is a consequence of who ran the installer, not of the package's scope.
+      #
+      # So the assertion is AssignmentType, which is Windows' own answer. The hive and the paths are
+      # still printed, because a gate that shows only a verdict cannot be told apart from a gate
+      # with a bug in it, but they are evidence and not the decision.
       - name: Assert the install scope is the one we declared
         shell: pwsh
         run: |
@@ -729,120 +633,70 @@ jobs:
           }
           $intended = if ($Matches[1] -eq 'true') { "per-user" } else { "per-machine" }
 
-          # Measured from where Windows Installer actually registered the product, not from a guess.
-          $hkcu = Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
-                  Where-Object { $_.DisplayName -like "*Reveal*" }
-          $hklm = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-                                   "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
-                  Where-Object { $_.DisplayName -like "*Reveal*" }
-
-          if ($hkcu -and $hklm) { $actual = "both" } elseif ($hkcu) { $actual = "per-user" } elseif ($hklm) { $actual = "per-machine" } else { $actual = "none" }
+          # Windows' own accounting. Every InvokeMember is piped to Out-Null where its value is not
+          # wanted: in PowerShell whatever is left on the output stream becomes the return value,
+          # which broke two earlier probes in this file.
+          $msi = New-Object -ComObject WindowsInstaller.Installer
+          $products = $msi.GetType().InvokeMember("Products","GetProperty",$null,$msi,$null)
+          $code = $null
+          foreach ($pc in $products) {
+            $name = $msi.GetType().InvokeMember("ProductInfo","GetProperty",$null,$msi,@($pc,"ProductName"))
+            if ($name -like "*Reveal*") { $code = $pc; break }
+          }
+          if (-not $code) {
+            Write-Error "No installed product named *Reveal* is registered with Windows Installer. The install did not take."
+            exit 1
+          }
+          $assignment = $msi.GetType().InvokeMember("ProductInfo","GetProperty",$null,$msi,@($code,"AssignmentType"))
+          $location   = $msi.GetType().InvokeMember("ProductInfo","GetProperty",$null,$msi,@($code,"InstallLocation"))
+          $actual = if ("$assignment" -eq "0") { "per-user" } else { "per-machine" }
 
           Write-Host "Declared in build.gradle.kts : $intended"
-          Write-Host "Measured after installing    : $actual"
+          Write-Host "Windows AssignmentType       : $assignment  ($actual)"
+          Write-Host "Windows InstallLocation      : $location"
+          Write-Host "ProductCode                  : $code"
 
-          # SHOW THE EVIDENCE, not just the verdict. A gate that reports "per-machine" without
-          # saying which key it read cannot be told apart from a gate with a bug in it, and this
-          # one contradicted four other signals the first time it ran: the MSI has no ALLUSERS row
-          # (Microsoft documents unset ALLUSERS as per-user), its install directory is
-          # LocalAppDataFolder, its summary stream sets "elevated privileges are not required", and
-          # the previous release installed into %LOCALAPPDATA%. Either the measurement is wrong or
-          # the package is inconsistent with itself, and both are worth seeing in full.
           Write-Host ""
-          Write-Host "--- every uninstall entry matching *Reveal*, with its hive ---"
+          Write-Host "--- evidence, NOT the decision: uninstall entries by hive ---"
           foreach ($hive in @("HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
                               "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
                               "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall")) {
-            $found = Get-ChildItem $hive -ErrorAction SilentlyContinue | ForEach-Object {
-              $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
-              if ($props.DisplayName -like "*Reveal*") { $props }
-            }
-            if ($found) {
-              foreach ($f in $found) {
-                Write-Host "  $hive"
-                Write-Host "     DisplayName     : $($f.DisplayName) $($f.DisplayVersion)"
-                Write-Host "     InstallLocation : $($f.InstallLocation)"
-                Write-Host "     UninstallString : $($f.UninstallString)"
-              }
-            } else {
-              Write-Host "  $hive  -> nothing"
-            }
-          }
-          Write-Host ""
-          Write-Host "--- where the files landed ---"
-          foreach ($root in @($env:LOCALAPPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
-            if (-not $root) { continue }
-            $hit = Get-ChildItem $root -Directory -Filter "Reveal*" -ErrorAction SilentlyContinue
-            foreach ($h in $hit) { Write-Host "  $($h.FullName)" }
-          }
-          Write-Host ""
-
-          # EXPERIMENT: can this package be made to register per-user at all?
-          #
-          # The measurement above says files land in %LOCALAPPDATA% while the uninstall entry is
-          # written to HKLM, and writing that key needs administrator rights. If that is what a
-          # certifier meets, the install cannot succeed for a standard user, which is the 1603 we
-          # were told about and never actually fixed: perUserInstall = true moved the FILES and left
-          # the REGISTRATION per-machine.
-          #
-          # Windows Installer selects the context from ALLUSERS and MSIINSTALLPERUSER. ALLUSERS=2
-          # with MSIINSTALLPERUSER=1 is Microsoft's documented way to ask for per-user without
-          # elevation. If the jpackage wrapper forwards properties through to msiexec, then this is
-          # a fix we can DECLARE in Partner Center's install parameters with no rebuild at all.
-          # If it does not forward them, we need to change the package, and knowing which costs one
-          # run instead of another rejection cycle.
-          #
-          # $actual is already captured above, so the verdict below is unaffected by this.
-          $probe = "inconclusive"
-          try {
-            if ($hklm) { $pc = ($hklm | Select-Object -First 1).PSChildName } else { $pc = $null }
-            if ($pc) {
-              Write-Host "--- experiment: reinstall asking for per-user explicitly ---"
-              Start-Process "msiexec.exe" -Wait -ArgumentList @("/X", $pc, "/quiet", "/norestart")
-              Start-Sleep -Seconds 5
-              $inst = "${{ steps.installed_pkg.outputs.installer }}"
-              Start-Process $inst -Wait -ArgumentList @("/quiet", "/norestart", "ALLUSERS=2", "MSIINSTALLPERUSER=1")
-              Start-Sleep -Seconds 5
-              $c2 = Get-ChildItem "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" -ErrorAction SilentlyContinue |
+            $hits = Get-ChildItem $hive -ErrorAction SilentlyContinue |
                     ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
                     Where-Object { $_.DisplayName -like "*Reveal*" }
-              $m2 = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" -ErrorAction SilentlyContinue |
-                    ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
-                    Where-Object { $_.DisplayName -like "*Reveal*" }
-              if ($c2 -and -not $m2) { $probe = "PER-USER. Passing ALLUSERS=2 MSIINSTALLPERUSER=1 fixes it with no rebuild." }
-              elseif ($m2) { $probe = "STILL PER-MACHINE. The wrapper ignores the properties; the package itself must change." }
-              else { $probe = "reinstall registered nothing at all" }
-              Write-Host "  result: $probe"
-            }
-          } catch {
-            Write-Host "  experiment failed: $_"
+            if ($hits) { foreach ($h in $hits) { Write-Host "  $hive -> $($h.DisplayName) $($h.DisplayVersion)" } }
+            else { Write-Host "  $hive -> nothing" }
           }
-          @("", "### Per-user experiment", "", $probe) -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          Write-Host ""
+          Write-Host "  (an administrator performing a per-user install lands the entry in HKLM; that is expected)"
 
-          if ($actual -eq "none") {
-            Write-Error "No uninstall entry in HKCU or HKLM. The installer reported success and registered nothing. This is the 10.2.7 rejection."
-            exit 1
-          }
           if ($actual -ne $intended) {
-            Write-Error "SCOPE MISMATCH. build.gradle.kts asks for $intended, the built package installed $actual. Shipping this means guessing at certification."
+            Write-Error "SCOPE MISMATCH. build.gradle.kts asks for $intended and Windows reports $actual."
             exit 1
           }
 
-          # The consequence, stated rather than left to be worked out from a registry path. This is
-          # the sentence that would have made the 10.1.2.10 rejection predictable before submitting.
           $verdict = if ($intended -eq "per-user") {
-            "ONLY $env:USERNAME can run this app. Any other Windows account on this PC sees no shortcut, no uninstall entry and no executable. If the Store installs under a different account than the one a certifier tests in, the product appears to be missing."
+            "Installed per-user, into the profile of whoever ran the installer. ONLY that account gets a working app: any other Windows account on this PC has no executable. If the Store installs under a different account than the one a certifier tests in, the product appears to be missing."
           } else {
-            "Every account on this PC can run this app. The installer requires elevation, so a certifier who cannot elevate cannot install it at all."
+            "Installed per-machine. Every account on this PC can run it, and the installer requires elevation, so a certifier who cannot elevate cannot install it at all."
           }
           Write-Host ""
           Write-Host "WHO CAN RUN IT: $verdict"
-
-          @("## Windows install scope", "", "Declared: ``$intended``  |  Measured: ``$actual``", "", $verdict) -join "`n" |
+          @("## Windows install scope", "", "Declared: ``$intended``  |  Windows AssignmentType: ``$assignment`` (``$actual``)", "", $verdict) -join "`n" |
             Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
-      # Now the launch surfaces, asserted AGAINST THE DECLARED SCOPE rather than accepting either.
+      # The launch surfaces. Asserted against the declared scope where that is meaningful, and
+      # deliberately NOT for the uninstall entry.
+      #
+      # The binary and the Start Menu shortcut DO follow the scope: a per-user install puts both in
+      # the installing profile, a per-machine one puts them in Program Files and All Users. Those are
+      # worth pinning, because a shortcut that is missing from where the scope says it should be is
+      # the 10.1.2.10 rejection.
+      #
+      # The uninstall entry does NOT reliably follow the scope, and demanding HKCU for a per-user
+      # install would fail a correct build. msiexec writes the ARP entry to HKLM when an
+      # ADMINISTRATOR performs a per-user install, which is exactly what this runner does. So the
+      # requirement is that the entry EXISTS somewhere a person can find it and carries an
+      # UninstallString, which is what policy 10.2.7 actually asks for.
       - name: Assert the shortcut, uninstall entry and binary match that scope
         shell: pwsh
         run: |
@@ -856,23 +710,23 @@ jobs:
           $lnk = @(Get-ChildItem $startMenu -Recurse -Filter "*Reveal*.lnk" -ErrorAction SilentlyContinue) | Select-Object -First 1
           if ($lnk) { Write-Host "OK   Start Menu shortcut: $($lnk.FullName)" }
           else {
-            Write-Error "No Start Menu shortcut under $startMenu, which is where a $(if($perUser){'per-user'}else{'per-machine'}) install must put it. This is the 10.1.2.10 rejection."
+            Write-Error "No Start Menu shortcut under $startMenu, where a $(if($perUser){'per-user'}else{'per-machine'}) install must put it. This is the 10.1.2.10 rejection."
             $fail = $true
           }
 
-          $arp = if ($perUser) {
-            Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
-              Where-Object { $_.DisplayName -like "*Reveal*" } | Select-Object -First 1
-          } else {
-            Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-                             "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
-              Where-Object { $_.DisplayName -like "*Reveal*" } | Select-Object -First 1
-          }
+          # Either hive. See the comment above for why demanding one would fail a correct build.
+          $arp = Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                                  "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                                  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+                 Where-Object { $_.DisplayName -like "*Reveal*" } | Select-Object -First 1
           if ($arp) {
             Write-Host "OK   Add/Remove Programs entry: $($arp.DisplayName) $($arp.DisplayVersion)"
-            if (-not $arp.UninstallString) { Write-Error "The entry has no UninstallString, so it cannot be removed. 10.2.7."; $fail = $true }
+            if (-not $arp.UninstallString) {
+              Write-Error "The entry has no UninstallString, so it cannot be removed. 10.2.7."
+              $fail = $true
+            }
           } else {
-            Write-Error "No Add/Remove Programs entry in the hive this scope writes to. This is the 10.2.7 rejection."
+            Write-Error "No Add/Remove Programs entry in any hive. This is the 10.2.7 rejection."
             $fail = $true
           }
 
@@ -882,7 +736,6 @@ jobs:
           else { Write-Error "No executable under $root. The installer reported no error and installed nothing where this scope puts it."; $fail = $true }
 
           if ($fail) { exit 1 }
-
 
       # Finds the INSTALLED executable, in both places an install can put it.
       #
