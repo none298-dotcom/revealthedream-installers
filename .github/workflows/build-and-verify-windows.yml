@@ -415,23 +415,78 @@ jobs:
       # which is what both rejections were actually about.
       #
       # Never fails the build. It is a measurement, and the Exe is still what the gates below judge.
-      - name: Can the MSI install per-user
+      # WHAT IS ACTUALLY IN THE MSI, and can the scope be edited into it.
+      #
+      # Established already, by measurement: the Exe registers in HKLM while its files sit in
+      # %LOCALAPPDATA%, and BOTH the Exe and the Msi ignore ALLUSERS=2 MSIINSTALLPERUSER=1 passed on
+      # the command line. So the package hardcodes its scope and no submission-time parameter can
+      # change it. Writing that HKLM key needs an administrator, which is the rejection.
+      #
+      # This step opens the MSI database through the WindowsInstaller COM API, which is the
+      # authoritative reader. A hand-rolled parser was tried off-runner and produced misaligned
+      # garbage rows, so nothing it claimed about ALLUSERS was worth anything. Do not repeat that.
+      #
+      # Then it tries the actual fix: drop ALLUSERS from the Property table, install, and see which
+      # hive it lands in. Microsoft documents an unset ALLUSERS as the per-user context.
+      #
+      # Never fails the build. It is a measurement, and it cleans up after itself so the Exe gates
+      # below still see a clean machine.
+      - name: What is in the MSI, and can its scope be edited
         if: ${{ inputs.package_url == '' }}
         shell: pwsh
         continue-on-error: true
         working-directory: android
         run: |
-          $msi = @(Get-ChildItem -Recurse -Filter *.msi -Path desktop/build/compose/binaries/main/msi -ErrorAction SilentlyContinue)
-          if ($msi.Count -ne 1) {
-            Write-Host "Expected exactly one msi, found $($msi.Count). Nothing to measure."
-            exit 0
-          }
-          $path = $msi[0].FullName
-          Write-Host "MSI: $path"
+          $found = @(Get-ChildItem -Recurse -Filter *.msi -Path desktop/build/compose/binaries/main/msi -ErrorAction SilentlyContinue)
+          if ($found.Count -ne 1) { Write-Host "Expected exactly one msi, found $($found.Count)."; exit 0 }
+          $src = $found[0].FullName
+          Write-Host "MSI: $src"
 
-          $log = "$env:RUNNER_TEMP\msi-peruser.log"
-          $p = Start-Process "msiexec.exe" -Wait -PassThru -ArgumentList @(
-            "/i", "`"$path`"", "/quiet", "/norestart", "ALLUSERS=2", "MSIINSTALLPERUSER=1", "/log", "`"$log`"")
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          function Query($dbPath, $sql, $mode) {
+            $db = $installer.GetType().InvokeMember("OpenDatabase","InvokeMethod",$null,$installer,@($dbPath,$mode))
+            $v  = $db.GetType().InvokeMember("OpenView","InvokeMethod",$null,$db,@($sql))
+            $v.GetType().InvokeMember("Execute","InvokeMethod",$null,$v,$null)
+            $out=@()
+            while ($true) {
+              $r = $v.GetType().InvokeMember("Fetch","InvokeMethod",$null,$v,$null)
+              if (-not $r) { break }
+              $a = $r.GetType().InvokeMember("StringData","GetProperty",$null,$r,@(1))
+              $b = $r.GetType().InvokeMember("StringData","GetProperty",$null,$r,@(2))
+              $out += ,@($a,$b)
+            }
+            $v.GetType().InvokeMember("Close","InvokeMethod",$null,$v,$null)
+            return ,@($out,$db)
+          }
+
+          Write-Host ""
+          Write-Host "--- Property table, read through the Windows Installer API ---"
+          $res = Query $src "SELECT Property, Value FROM Property" 0
+          foreach ($row in $res[0]) { Write-Host ("   {0,-28} = {1}" -f $row[0], $row[1]) }
+
+          $allusers = @($res[0] | Where-Object { $_[0] -eq "ALLUSERS" })
+          if ($allusers) { Write-Host "`n   ALLUSERS is present, value = '$($allusers[0][1])'" }
+          else { Write-Host "`n   ALLUSERS is NOT in the Property table" }
+
+          # --- try the edit ---
+          $work = "$env:RUNNER_TEMP\scope-test.msi"
+          Copy-Item $src $work -Force
+          $db = $installer.GetType().InvokeMember("OpenDatabase","InvokeMethod",$null,$installer,@($work,1))
+          foreach ($sql in @("DELETE FROM Property WHERE Property='ALLUSERS'")) {
+            try {
+              $v = $db.GetType().InvokeMember("OpenView","InvokeMethod",$null,$db,@($sql))
+              $v.GetType().InvokeMember("Execute","InvokeMethod",$null,$v,$null)
+              $v.GetType().InvokeMember("Close","InvokeMethod",$null,$v,$null)
+              Write-Host "   applied: $sql"
+            } catch { Write-Host "   FAILED: $sql  ->  $_" }
+          }
+          $db.GetType().InvokeMember("Commit","InvokeMethod",$null,$db,$null)
+          [System.Runtime.InteropServices.Marshal]::ReleaseComObject($db) | Out-Null
+
+          Write-Host ""
+          Write-Host "--- install the edited MSI ---"
+          $log = "$env:RUNNER_TEMP\scope-test.log"
+          $p = Start-Process "msiexec.exe" -Wait -PassThru -ArgumentList @("/i","`"$work`"","/quiet","/norestart","/log","`"$log`"")
           Write-Host "msiexec exit code: $($p.ExitCode)"
 
           function Entries($hive) {
@@ -441,27 +496,15 @@ jobs:
           }
           $cu = Entries "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
           $lm = Entries "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
-
-          if ($cu -and -not $lm) {
-            $verdict = "PER-USER. msiexec honours ALLUSERS=2 MSIINSTALLPERUSER=1. Submit the MSI with those parameters."
-          } elseif ($lm) {
-            $verdict = "STILL PER-MACHINE. The package itself hardcodes the scope; the MSI route does not help either."
-          } else {
-            $verdict = "Registered nothing. msiexec exit code was $($p.ExitCode); see the log."
-          }
+          if ($cu -and -not $lm) { $verdict = "PER-USER. Dropping ALLUSERS fixes the scope. Post-process the MSI, sign it, submit it." }
+          elseif ($lm) { $verdict = "STILL PER-MACHINE after dropping ALLUSERS. Something else forces the scope; read the Property dump above." }
+          else { $verdict = "Registered nothing. msiexec exit code $($p.ExitCode)." }
           Write-Host "RESULT: $verdict"
-          foreach ($e in @($cu) + @($lm)) { Write-Host "   $($e.DisplayName)  InstallLocation=$($e.InstallLocation)" }
+          foreach ($e in @($cu)+@($lm)) { Write-Host "   $($e.DisplayName)  InstallLocation=$($e.InstallLocation)" }
+          @("", "### MSI scope edit", "", $verdict) -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
-          if (-not ($cu -or $lm) -and (Test-Path $log)) {
-            Write-Host "--- tail of the msiexec log ---"
-            Get-Content $log -Tail 25 | ForEach-Object { Write-Host "  $_" }
-          }
-
-          @("", "### Can the MSI install per-user", "", $verdict) -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-
-          # Leave the machine clean for the Exe gates below.
-          foreach ($e in @($cu) + @($lm)) {
-            if ($e.PSChildName) { Start-Process "msiexec.exe" -Wait -ArgumentList @("/x", $e.PSChildName, "/quiet", "/norestart") }
+          foreach ($e in @($cu)+@($lm)) {
+            if ($e.PSChildName) { Start-Process "msiexec.exe" -Wait -ArgumentList @("/x",$e.PSChildName,"/quiet","/norestart") }
           }
           Start-Sleep -Seconds 5
 
