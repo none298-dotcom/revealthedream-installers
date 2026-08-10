@@ -632,6 +632,49 @@ jobs:
           }
           Write-Host ""
 
+          # EXPERIMENT: can this package be made to register per-user at all?
+          #
+          # The measurement above says files land in %LOCALAPPDATA% while the uninstall entry is
+          # written to HKLM, and writing that key needs administrator rights. If that is what a
+          # certifier meets, the install cannot succeed for a standard user, which is the 1603 we
+          # were told about and never actually fixed: perUserInstall = true moved the FILES and left
+          # the REGISTRATION per-machine.
+          #
+          # Windows Installer selects the context from ALLUSERS and MSIINSTALLPERUSER. ALLUSERS=2
+          # with MSIINSTALLPERUSER=1 is Microsoft's documented way to ask for per-user without
+          # elevation. If the jpackage wrapper forwards properties through to msiexec, then this is
+          # a fix we can DECLARE in Partner Center's install parameters with no rebuild at all.
+          # If it does not forward them, we need to change the package, and knowing which costs one
+          # run instead of another rejection cycle.
+          #
+          # $actual is already captured above, so the verdict below is unaffected by this.
+          $probe = "inconclusive"
+          try {
+            if ($hklm) { $pc = ($hklm | Select-Object -First 1).PSChildName } else { $pc = $null }
+            if ($pc) {
+              Write-Host "--- experiment: reinstall asking for per-user explicitly ---"
+              Start-Process "msiexec.exe" -Wait -ArgumentList @("/X", $pc, "/quiet", "/norestart")
+              Start-Sleep -Seconds 5
+              $inst = "${{ steps.installed_pkg.outputs.installer }}"
+              Start-Process $inst -Wait -ArgumentList @("/quiet", "/norestart", "ALLUSERS=2", "MSIINSTALLPERUSER=1")
+              Start-Sleep -Seconds 5
+              $c2 = Get-ChildItem "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" -ErrorAction SilentlyContinue |
+                    ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+                    Where-Object { $_.DisplayName -like "*Reveal*" }
+              $m2 = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" -ErrorAction SilentlyContinue |
+                    ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+                    Where-Object { $_.DisplayName -like "*Reveal*" }
+              if ($c2 -and -not $m2) { $probe = "PER-USER. Passing ALLUSERS=2 MSIINSTALLPERUSER=1 fixes it with no rebuild." }
+              elseif ($m2) { $probe = "STILL PER-MACHINE. The wrapper ignores the properties; the package itself must change." }
+              else { $probe = "reinstall registered nothing at all" }
+              Write-Host "  result: $probe"
+            }
+          } catch {
+            Write-Host "  experiment failed: $_"
+          }
+          @("", "### Per-user experiment", "", $probe) -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Write-Host ""
+
           if ($actual -eq "none") {
             Write-Error "No uninstall entry in HKCU or HKLM. The installer reported success and registered nothing. This is the 10.2.7 rejection."
             exit 1
