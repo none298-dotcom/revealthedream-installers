@@ -431,6 +431,26 @@ jobs:
       #
       # Never fails the build. It is a measurement, and it cleans up after itself so the Exe gates
       # below still see a clean machine.
+      # WHAT IS ACTUALLY IN THE MSI, and can the scope be edited into it.
+      #
+      # Established by measurement: the Exe registers in HKLM while its files sit in %LOCALAPPDATA%,
+      # and BOTH the Exe and the Msi ignore ALLUSERS=2 MSIINSTALLPERUSER=1 on the command line,
+      # msiexec exiting 0 and still landing in HKLM. So the package hardcodes its scope and no
+      # submission-time parameter can change it. Writing that HKLM key needs an administrator, which
+      # is the rejection.
+      #
+      # Read through the WindowsInstaller COM API, the authoritative reader. A hand-rolled parser was
+      # tried off-runner and produced misaligned garbage rows, so its claim that ALLUSERS was absent
+      # meant nothing. Do not repeat that.
+      #
+      # EVERY InvokeMember IS PIPED TO Out-Null ON PURPOSE. The first version of this step wrapped
+      # the query in a function and returned its rows, and PowerShell handed back the COM call
+      # results instead, because whatever a function leaves on the output stream IS its return
+      # value. It failed with "Cannot index into a null array". That is the same trap AGENTS.md
+      # already records for Set-DisplayResolution in the store-screenshot script. Inline and
+      # explicitly silenced, so there is nothing on the stream to confuse.
+      #
+      # Never fails the build, and uninstalls itself so the Exe gates below see a clean machine.
       - name: What is in the MSI, and can its scope be edited
         if: ${{ inputs.package_url == '' }}
         shell: pwsh
@@ -442,46 +462,52 @@ jobs:
           $src = $found[0].FullName
           Write-Host "MSI: $src"
 
-          $installer = New-Object -ComObject WindowsInstaller.Installer
-          function Query($dbPath, $sql, $mode) {
-            $db = $installer.GetType().InvokeMember("OpenDatabase","InvokeMethod",$null,$installer,@($dbPath,$mode))
-            $v  = $db.GetType().InvokeMember("OpenView","InvokeMethod",$null,$db,@($sql))
-            $v.GetType().InvokeMember("Execute","InvokeMethod",$null,$v,$null)
-            $out=@()
+          $msi = New-Object -ComObject WindowsInstaller.Installer
+
+          function Get-Rows([string]$dbPath, [int]$mode) {
+            $db = $msi.GetType().InvokeMember("OpenDatabase","InvokeMethod",$null,$msi,@($dbPath,$mode))
+            $vw = $db.GetType().InvokeMember("OpenView","InvokeMethod",$null,$db,@("SELECT Property, Value FROM Property"))
+            $vw.GetType().InvokeMember("Execute","InvokeMethod",$null,$vw,$null) | Out-Null
+            $rows = [System.Collections.ArrayList]::new()
             while ($true) {
-              $r = $v.GetType().InvokeMember("Fetch","InvokeMethod",$null,$v,$null)
-              if (-not $r) { break }
-              $a = $r.GetType().InvokeMember("StringData","GetProperty",$null,$r,@(1))
-              $b = $r.GetType().InvokeMember("StringData","GetProperty",$null,$r,@(2))
-              $out += ,@($a,$b)
+              $rec = $vw.GetType().InvokeMember("Fetch","InvokeMethod",$null,$vw,$null)
+              if ($null -eq $rec) { break }
+              $k = $rec.GetType().InvokeMember("StringData","GetProperty",$null,$rec,@(1))
+              $v = $rec.GetType().InvokeMember("StringData","GetProperty",$null,$rec,@(2))
+              $rows.Add([pscustomobject]@{ Name = $k; Value = $v }) | Out-Null
             }
-            $v.GetType().InvokeMember("Close","InvokeMethod",$null,$v,$null)
-            return ,@($out,$db)
+            $vw.GetType().InvokeMember("Close","InvokeMethod",$null,$vw,$null) | Out-Null
+            ,$rows
           }
 
           Write-Host ""
           Write-Host "--- Property table, read through the Windows Installer API ---"
-          $res = Query $src "SELECT Property, Value FROM Property" 0
-          foreach ($row in $res[0]) { Write-Host ("   {0,-28} = {1}" -f $row[0], $row[1]) }
+          $rows = Get-Rows $src 0
+          foreach ($r in $rows) { Write-Host ("   {0,-30} = {1}" -f $r.Name, $r.Value) }
+          Write-Host "   ($($rows.Count) rows)"
 
-          $allusers = @($res[0] | Where-Object { $_[0] -eq "ALLUSERS" })
-          if ($allusers) { Write-Host "`n   ALLUSERS is present, value = '$($allusers[0][1])'" }
+          $au = @($rows | Where-Object { $_.Name -eq "ALLUSERS" })
+          if ($au.Count -gt 0) { Write-Host "`n   ALLUSERS present, value = '$($au[0].Value)'" }
           else { Write-Host "`n   ALLUSERS is NOT in the Property table" }
 
           # --- try the edit ---
           $work = "$env:RUNNER_TEMP\scope-test.msi"
           Copy-Item $src $work -Force
-          $db = $installer.GetType().InvokeMember("OpenDatabase","InvokeMethod",$null,$installer,@($work,1))
-          foreach ($sql in @("DELETE FROM Property WHERE Property='ALLUSERS'")) {
-            try {
-              $v = $db.GetType().InvokeMember("OpenView","InvokeMethod",$null,$db,@($sql))
-              $v.GetType().InvokeMember("Execute","InvokeMethod",$null,$v,$null)
-              $v.GetType().InvokeMember("Close","InvokeMethod",$null,$v,$null)
-              Write-Host "   applied: $sql"
-            } catch { Write-Host "   FAILED: $sql  ->  $_" }
+          $db = $msi.GetType().InvokeMember("OpenDatabase","InvokeMethod",$null,$msi,@($work,1))
+          try {
+            $vw = $db.GetType().InvokeMember("OpenView","InvokeMethod",$null,$db,@("DELETE FROM Property WHERE Property='ALLUSERS'"))
+            $vw.GetType().InvokeMember("Execute","InvokeMethod",$null,$vw,$null) | Out-Null
+            $vw.GetType().InvokeMember("Close","InvokeMethod",$null,$vw,$null) | Out-Null
+            $db.GetType().InvokeMember("Commit","InvokeMethod",$null,$db,$null) | Out-Null
+            Write-Host "   edit applied and committed"
+          } catch {
+            Write-Host "   edit FAILED: $_"
           }
-          $db.GetType().InvokeMember("Commit","InvokeMethod",$null,$db,$null)
           [System.Runtime.InteropServices.Marshal]::ReleaseComObject($db) | Out-Null
+
+          $after = Get-Rows $work 0
+          $au2 = @($after | Where-Object { $_.Name -eq "ALLUSERS" })
+          Write-Host "   ALLUSERS after edit: $(if ($au2.Count -gt 0) { "'" + $au2[0].Value + "'" } else { 'gone' })"
 
           Write-Host ""
           Write-Host "--- install the edited MSI ---"
@@ -489,22 +515,27 @@ jobs:
           $p = Start-Process "msiexec.exe" -Wait -PassThru -ArgumentList @("/i","`"$work`"","/quiet","/norestart","/log","`"$log`"")
           Write-Host "msiexec exit code: $($p.ExitCode)"
 
-          function Entries($hive) {
+          function Get-Arp([string]$hive) {
             Get-ChildItem $hive -ErrorAction SilentlyContinue |
               ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
               Where-Object { $_.DisplayName -like "*Reveal*" }
           }
-          $cu = Entries "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
-          $lm = Entries "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
-          if ($cu -and -not $lm) { $verdict = "PER-USER. Dropping ALLUSERS fixes the scope. Post-process the MSI, sign it, submit it." }
-          elseif ($lm) { $verdict = "STILL PER-MACHINE after dropping ALLUSERS. Something else forces the scope; read the Property dump above." }
-          else { $verdict = "Registered nothing. msiexec exit code $($p.ExitCode)." }
+          $cu = @(Get-Arp "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")
+          $lm = @(Get-Arp "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")
+
+          if ($cu.Count -gt 0 -and $lm.Count -eq 0) {
+            $verdict = "PER-USER. Dropping ALLUSERS fixes the scope. Post-process the MSI, sign it, submit it."
+          } elseif ($lm.Count -gt 0) {
+            $verdict = "STILL PER-MACHINE after dropping ALLUSERS. Read the Property dump above for what else forces it."
+          } else {
+            $verdict = "Registered nothing. msiexec exit code $($p.ExitCode)."
+          }
           Write-Host "RESULT: $verdict"
-          foreach ($e in @($cu)+@($lm)) { Write-Host "   $($e.DisplayName)  InstallLocation=$($e.InstallLocation)" }
+          foreach ($e in ($cu + $lm)) { Write-Host "   $($e.DisplayName)  hive-key=$($e.PSChildName)  InstallLocation=$($e.InstallLocation)" }
           @("", "### MSI scope edit", "", $verdict) -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
-          foreach ($e in @($cu)+@($lm)) {
-            if ($e.PSChildName) { Start-Process "msiexec.exe" -Wait -ArgumentList @("/x",$e.PSChildName,"/quiet","/norestart") }
+          foreach ($e in ($cu + $lm)) {
+            if ($e.PSChildName) { Start-Process "msiexec.exe" -Wait -ArgumentList @("/x",$e.PSChildName,"/quiet","/norestart") | Out-Null }
           }
           Start-Sleep -Seconds 5
 
