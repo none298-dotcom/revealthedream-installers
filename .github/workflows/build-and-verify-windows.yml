@@ -451,7 +451,29 @@ jobs:
       # explicitly silenced, so there is nothing on the stream to confuse.
       #
       # Never fails the build, and uninstalls itself so the Exe gates below see a clean machine.
-      - name: What is in the MSI, and can its scope be edited
+      # WHY DOES A PACKAGE WITH NO ALLUSERS REGISTER IN HKLM?
+      #
+      # Measured so far. The Exe and the Msi both put files in %LOCALAPPDATA% and both write their
+      # uninstall entry to HKLM, which needs an administrator, which is the rejection. Neither
+      # honours ALLUSERS=2 MSIINSTALLPERUSER=1 on the command line. And the Property table, read
+      # through the Windows Installer API, has NO ALLUSERS row at all, which Microsoft documents as
+      # meaning the per-user context.
+      #
+      # Deleting ALLUSERS was therefore a no-op and proved nothing. So the remaining candidate is
+      # that jpackage AUTHORS the uninstall entry itself, as an explicit Registry row rooted at
+      # HKLM, rather than letting Windows Installer place it according to the install context. That
+      # would explain every observation at once, and it would mean the fix is to re-root that row
+      # rather than to argue with ALLUSERS.
+      #
+      # This dumps the Registry table and asks Windows what context the product actually installed
+      # in, which is the authoritative answer rather than an inference from a key path.
+      #
+      # Every InvokeMember is piped to Out-Null: whatever a function leaves on the output stream IS
+      # its return value in PowerShell, and the first version of this step returned COM call results
+      # instead of rows. Same trap AGENTS.md records for Set-DisplayResolution.
+      #
+      # Never fails the build. Uninstalls itself so the Exe gates below see a clean machine.
+      - name: Why does the MSI register per-machine
         if: ${{ inputs.package_url == '' }}
         shell: pwsh
         continue-on-error: true
@@ -464,56 +486,51 @@ jobs:
 
           $msi = New-Object -ComObject WindowsInstaller.Installer
 
-          function Get-Rows([string]$dbPath, [int]$mode) {
-            $db = $msi.GetType().InvokeMember("OpenDatabase","InvokeMethod",$null,$msi,@($dbPath,$mode))
-            $vw = $db.GetType().InvokeMember("OpenView","InvokeMethod",$null,$db,@("SELECT Property, Value FROM Property"))
+          function Get-Table([string]$dbPath, [string]$sql, [int]$cols) {
+            $db = $msi.GetType().InvokeMember("OpenDatabase","InvokeMethod",$null,$msi,@($dbPath,0))
+            $vw = $db.GetType().InvokeMember("OpenView","InvokeMethod",$null,$db,@($sql))
             $vw.GetType().InvokeMember("Execute","InvokeMethod",$null,$vw,$null) | Out-Null
             $rows = [System.Collections.ArrayList]::new()
             while ($true) {
               $rec = $vw.GetType().InvokeMember("Fetch","InvokeMethod",$null,$vw,$null)
               if ($null -eq $rec) { break }
-              $k = $rec.GetType().InvokeMember("StringData","GetProperty",$null,$rec,@(1))
-              $v = $rec.GetType().InvokeMember("StringData","GetProperty",$null,$rec,@(2))
-              $rows.Add([pscustomobject]@{ Name = $k; Value = $v }) | Out-Null
+              $vals = @()
+              for ($i = 1; $i -le $cols; $i++) {
+                $vals += $rec.GetType().InvokeMember("StringData","GetProperty",$null,$rec,@($i))
+              }
+              $rows.Add($vals) | Out-Null
             }
             $vw.GetType().InvokeMember("Close","InvokeMethod",$null,$vw,$null) | Out-Null
             ,$rows
           }
 
           Write-Host ""
-          Write-Host "--- Property table, read through the Windows Installer API ---"
-          $rows = Get-Rows $src 0
-          foreach ($r in $rows) { Write-Host ("   {0,-30} = {1}" -f $r.Name, $r.Value) }
-          Write-Host "   ($($rows.Count) rows)"
-
-          $au = @($rows | Where-Object { $_.Name -eq "ALLUSERS" })
-          if ($au.Count -gt 0) { Write-Host "`n   ALLUSERS present, value = '$($au[0].Value)'" }
-          else { Write-Host "`n   ALLUSERS is NOT in the Property table" }
-
-          # --- try the edit ---
-          $work = "$env:RUNNER_TEMP\scope-test.msi"
-          Copy-Item $src $work -Force
-          $db = $msi.GetType().InvokeMember("OpenDatabase","InvokeMethod",$null,$msi,@($work,1))
+          Write-Host "--- Registry table rows (Root, Key, Name, Value) ---"
+          Write-Host "    Root: -1 = follows the install context, 1 = HKCU, 2 = HKLM"
           try {
-            $vw = $db.GetType().InvokeMember("OpenView","InvokeMethod",$null,$db,@("DELETE FROM Property WHERE Property='ALLUSERS'"))
-            $vw.GetType().InvokeMember("Execute","InvokeMethod",$null,$vw,$null) | Out-Null
-            $vw.GetType().InvokeMember("Close","InvokeMethod",$null,$vw,$null) | Out-Null
-            $db.GetType().InvokeMember("Commit","InvokeMethod",$null,$db,$null) | Out-Null
-            Write-Host "   edit applied and committed"
-          } catch {
-            Write-Host "   edit FAILED: $_"
-          }
-          [System.Runtime.InteropServices.Marshal]::ReleaseComObject($db) | Out-Null
-
-          $after = Get-Rows $work 0
-          $au2 = @($after | Where-Object { $_.Name -eq "ALLUSERS" })
-          Write-Host "   ALLUSERS after edit: $(if ($au2.Count -gt 0) { "'" + $au2[0].Value + "'" } else { 'gone' })"
+            $reg = Get-Table $src "SELECT Root, Key, Name, Value FROM Registry" 4
+            Write-Host "    $($reg.Count) rows total"
+            foreach ($r in $reg) {
+              if ($r[1] -match "Uninstall" -or $r[0] -eq "2") {
+                Write-Host "     Root=$($r[0])  Key=$($r[1])"
+                Write-Host "        Name=$($r[2])  Value=$($r[3])"
+              }
+            }
+          } catch { Write-Host "    no Registry table, or it could not be read: $_" }
 
           Write-Host ""
-          Write-Host "--- install the edited MSI ---"
-          $log = "$env:RUNNER_TEMP\scope-test.log"
-          $p = Start-Process "msiexec.exe" -Wait -PassThru -ArgumentList @("/i","`"$work`"","/quiet","/norestart","/log","`"$log`"")
+          Write-Host "--- install it plainly, then ask Windows what context it used ---"
+          $p = Start-Process "msiexec.exe" -Wait -PassThru -ArgumentList @("/i","`"$src`"","/quiet","/norestart")
           Write-Host "msiexec exit code: $($p.ExitCode)"
+
+          $code = "{EE760583-EF78-3B8E-9128-DC6DDFC07D6F}"
+          foreach ($prop in @("AssignmentType","InstallLocation","ProductName","PackageCode")) {
+            try {
+              $val = $msi.GetType().InvokeMember("ProductInfo","GetProperty",$null,$msi,@($code,$prop))
+              Write-Host "   $prop = $val"
+            } catch { Write-Host "   $prop = <unavailable>" }
+          }
+          Write-Host "   AssignmentType 0 = per-user, 1 = per-machine"
 
           function Get-Arp([string]$hive) {
             Get-ChildItem $hive -ErrorAction SilentlyContinue |
@@ -522,17 +539,7 @@ jobs:
           }
           $cu = @(Get-Arp "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")
           $lm = @(Get-Arp "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")
-
-          if ($cu.Count -gt 0 -and $lm.Count -eq 0) {
-            $verdict = "PER-USER. Dropping ALLUSERS fixes the scope. Post-process the MSI, sign it, submit it."
-          } elseif ($lm.Count -gt 0) {
-            $verdict = "STILL PER-MACHINE after dropping ALLUSERS. Read the Property dump above for what else forces it."
-          } else {
-            $verdict = "Registered nothing. msiexec exit code $($p.ExitCode)."
-          }
-          Write-Host "RESULT: $verdict"
-          foreach ($e in ($cu + $lm)) { Write-Host "   $($e.DisplayName)  hive-key=$($e.PSChildName)  InstallLocation=$($e.InstallLocation)" }
-          @("", "### MSI scope edit", "", $verdict) -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Write-Host "   HKCU entries: $($cu.Count)   HKLM entries: $($lm.Count)"
 
           foreach ($e in ($cu + $lm)) {
             if ($e.PSChildName) { Start-Process "msiexec.exe" -Wait -ArgumentList @("/x",$e.PSChildName,"/quiet","/norestart") | Out-Null }
