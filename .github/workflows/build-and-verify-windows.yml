@@ -551,45 +551,114 @@ jobs:
       # condition per-user is not merely acceptable, it is the only scope that can install, and the
       # shortcut and uninstall entry land in the profile of the very user doing the testing. So the
       # assertion is not "per-machine" or "per-user", it is: whoever just installed this can SEE it.
-      - name: Assert the installing user can see the app and its uninstall entry
+      # ASSERT THE SCOPE WE DECLARED, THEN SAY WHO CAN ACTUALLY RUN THE APP.
+      #
+      # THIS IS THE HOLE THAT LET TWO REJECTIONS THROUGH. This job runs as an administrator, so it
+      # can install EITHER scope successfully, and the assertions here used to accept a shortcut in
+      # the user profile OR All Users, an uninstall key in HKCU OR HKLM, and a binary under
+      # %LOCALAPPDATA% OR Program Files. Whatever we shipped, it agreed. A gate that passes both
+      # answers to the question being asked is not testing that question.
+      #
+      # Scope is not a packaging detail, it decides WHO CAN RUN THE APP:
+      #   per-machine  Program Files + HKLM. Every account on the PC sees it. Needs elevation.
+      #   per-user     %LOCALAPPDATA% + HKCU. ONLY the installing account sees it. Every other
+      #                account has no shortcut, no uninstall entry and no executable.
+      #
+      # Microsoft rejected 1.3.1 under 10.1.2.10, "primary functionality for the product requires a
+      # Windows account with administrator privileges". That package CANNOT require elevation: its
+      # MSI sets the summary-information bit for "elevated privileges are not required", its exe
+      # manifest is asInvoker, and it installs here to %LOCALAPPDATA% with exit code 0. So the
+      # finding is not about elevation at all, it is about WHICH ACCOUNT HAS THE APP, and that is
+      # precisely what scope decides. The mirror image of the earlier per-machine rejection, where
+      # a certifier who could not elevate could not install it in the first place.
+      #
+      # So: intent lives in ONE place (build.gradle.kts), the installed artifact is measured against
+      # it, and the consequence for a second user is printed in plain words instead of inferred.
+      - name: Assert the install scope is the one we declared
+        shell: pwsh
+        run: |
+          $gradle = Get-Content "android/desktop/build.gradle.kts" -Raw
+          if ($gradle -notmatch 'perUserInstall\s*=\s*(true|false)') {
+            Write-Error "Could not read perUserInstall from build.gradle.kts. This gate must never assume a scope."
+            exit 1
+          }
+          $intended = if ($Matches[1] -eq 'true') { "per-user" } else { "per-machine" }
+
+          # Measured from where Windows Installer actually registered the product, not from a guess.
+          $hkcu = Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DisplayName -like "*Reveal*" }
+          $hklm = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                                   "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DisplayName -like "*Reveal*" }
+
+          if ($hkcu -and $hklm) { $actual = "both" } elseif ($hkcu) { $actual = "per-user" } elseif ($hklm) { $actual = "per-machine" } else { $actual = "none" }
+
+          Write-Host "Declared in build.gradle.kts : $intended"
+          Write-Host "Measured after installing    : $actual"
+
+          if ($actual -eq "none") {
+            Write-Error "No uninstall entry in HKCU or HKLM. The installer reported success and registered nothing. This is the 10.2.7 rejection."
+            exit 1
+          }
+          if ($actual -ne $intended) {
+            Write-Error "SCOPE MISMATCH. build.gradle.kts asks for $intended, the built package installed $actual. Shipping this means guessing at certification."
+            exit 1
+          }
+
+          # The consequence, stated rather than left to be worked out from a registry path. This is
+          # the sentence that would have made the 10.1.2.10 rejection predictable before submitting.
+          $verdict = if ($intended -eq "per-user") {
+            "ONLY $env:USERNAME can run this app. Any other Windows account on this PC sees no shortcut, no uninstall entry and no executable. If the Store installs under a different account than the one a certifier tests in, the product appears to be missing."
+          } else {
+            "Every account on this PC can run this app. The installer requires elevation, so a certifier who cannot elevate cannot install it at all."
+          }
+          Write-Host ""
+          Write-Host "WHO CAN RUN IT: $verdict"
+
+          @("## Windows install scope", "", "Declared: ``$intended``  |  Measured: ``$actual``", "", $verdict) -join "`n" |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      # Now the launch surfaces, asserted AGAINST THE DECLARED SCOPE rather than accepting either.
+      - name: Assert the shortcut, uninstall entry and binary match that scope
         shell: pwsh
         run: |
           $fail = $false
+          $gradle = Get-Content "android/desktop/build.gradle.kts" -Raw
+          $null = $gradle -match 'perUserInstall\s*=\s*(true|false)'
+          $perUser = $Matches[1] -eq 'true'
 
-          $perUser = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs"
-          $allUsers = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs"
-          $lnk = @(Get-ChildItem $perUser, $allUsers -Recurse -Filter "*Reveal*.lnk" -ErrorAction SilentlyContinue) | Select-Object -First 1
-          if ($lnk) {
-            Write-Host "OK   Start Menu shortcut: $($lnk.FullName)"
-          } else {
-            Write-Error "No Start Menu shortcut in either the user's profile or All Users. This is the 10.1.2.10 rejection."
+          $startMenu = if ($perUser) { "$env:APPDATA\Microsoft\Windows\Start Menu\Programs" }
+                       else          { "$env:ProgramData\Microsoft\Windows\Start Menu\Programs" }
+          $lnk = @(Get-ChildItem $startMenu -Recurse -Filter "*Reveal*.lnk" -ErrorAction SilentlyContinue) | Select-Object -First 1
+          if ($lnk) { Write-Host "OK   Start Menu shortcut: $($lnk.FullName)" }
+          else {
+            Write-Error "No Start Menu shortcut under $startMenu, which is where a $(if($perUser){'per-user'}else{'per-machine'}) install must put it. This is the 10.1.2.10 rejection."
             $fail = $true
           }
 
-          $keys = @(
-            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*")
-          $arp = Get-ItemProperty $keys -ErrorAction SilentlyContinue |
-                 Where-Object { $_.DisplayName -like "*Reveal*" } | Select-Object -First 1
+          $arp = if ($perUser) {
+            Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -like "*Reveal*" } | Select-Object -First 1
+          } else {
+            Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                             "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -like "*Reveal*" } | Select-Object -First 1
+          }
           if ($arp) {
             Write-Host "OK   Add/Remove Programs entry: $($arp.DisplayName) $($arp.DisplayVersion)"
-            if (-not $arp.UninstallString) {
-              Write-Error "The entry has no UninstallString, so it cannot be removed. 10.2.7."
-              $fail = $true
-            }
+            if (-not $arp.UninstallString) { Write-Error "The entry has no UninstallString, so it cannot be removed. 10.2.7."; $fail = $true }
           } else {
-            Write-Error "No Add/Remove Programs entry anywhere. This is the 10.2.7 rejection."
+            Write-Error "No Add/Remove Programs entry in the hive this scope writes to. This is the 10.2.7 rejection."
             $fail = $true
           }
 
-          # The whole point of an unelevated install: it must have produced a real installation, not
-          # a silent no-op that leaves the exit code looking fine.
-          $exe = @(Get-ChildItem "$env:LOCALAPPDATA", "$env:ProgramFiles" -Recurse -Filter "Reveal the Dream.exe" -ErrorAction SilentlyContinue) | Select-Object -First 1
+          $root = if ($perUser) { $env:LOCALAPPDATA } else { $env:ProgramFiles }
+          $exe = @(Get-ChildItem $root -Recurse -Filter "Reveal the Dream.exe" -ErrorAction SilentlyContinue) | Select-Object -First 1
           if ($exe) { Write-Host "OK   Installed binary: $($exe.FullName)" }
-          else { Write-Error "The installer reported no error and installed no executable."; $fail = $true }
+          else { Write-Error "No executable under $root. The installer reported no error and installed nothing where this scope puts it."; $fail = $true }
 
           if ($fail) { exit 1 }
+
 
       # Finds the INSTALLED executable, in both places an install can put it.
       #
