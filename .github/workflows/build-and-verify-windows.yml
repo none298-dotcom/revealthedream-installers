@@ -596,6 +596,42 @@ jobs:
           Write-Host "Declared in build.gradle.kts : $intended"
           Write-Host "Measured after installing    : $actual"
 
+          # SHOW THE EVIDENCE, not just the verdict. A gate that reports "per-machine" without
+          # saying which key it read cannot be told apart from a gate with a bug in it, and this
+          # one contradicted four other signals the first time it ran: the MSI has no ALLUSERS row
+          # (Microsoft documents unset ALLUSERS as per-user), its install directory is
+          # LocalAppDataFolder, its summary stream sets "elevated privileges are not required", and
+          # the previous release installed into %LOCALAPPDATA%. Either the measurement is wrong or
+          # the package is inconsistent with itself, and both are worth seeing in full.
+          Write-Host ""
+          Write-Host "--- every uninstall entry matching *Reveal*, with its hive ---"
+          foreach ($hive in @("HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                              "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                              "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall")) {
+            $found = Get-ChildItem $hive -ErrorAction SilentlyContinue | ForEach-Object {
+              $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+              if ($props.DisplayName -like "*Reveal*") { $props }
+            }
+            if ($found) {
+              foreach ($f in $found) {
+                Write-Host "  $hive"
+                Write-Host "     DisplayName     : $($f.DisplayName) $($f.DisplayVersion)"
+                Write-Host "     InstallLocation : $($f.InstallLocation)"
+                Write-Host "     UninstallString : $($f.UninstallString)"
+              }
+            } else {
+              Write-Host "  $hive  -> nothing"
+            }
+          }
+          Write-Host ""
+          Write-Host "--- where the files landed ---"
+          foreach ($root in @($env:LOCALAPPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+            if (-not $root) { continue }
+            $hit = Get-ChildItem $root -Directory -Filter "Reveal*" -ErrorAction SilentlyContinue
+            foreach ($h in $hit) { Write-Host "  $($h.FullName)" }
+          }
+          Write-Host ""
+
           if ($actual -eq "none") {
             Write-Error "No uninstall entry in HKCU or HKLM. The installer reported success and registered nothing. This is the 10.2.7 rejection."
             exit 1
