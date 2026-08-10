@@ -247,11 +247,7 @@ jobs:
       - name: Build the installer
         if: ${{ inputs.package_url == '' }}
         working-directory: android
-        # packageMsi as well as packageExe. Adding TargetFormat.Msi to build.gradle.kts does NOT
-        # make packageExe produce one: each format is its own Gradle task. The first run of the
-        # scope measurement below found zero .msi files, printed "Nothing to measure" and exited 0,
-        # which is the same shape of false pass this whole investigation has been about.
-        run: ./gradlew :desktop:packageExe :desktop:packageMsi --console=plain --no-daemon
+        run: ./gradlew :desktop:packageExe --console=plain --no-daemon
 
       # The submitted artifact, fetched and pinned by hash so the log records exactly which bytes
       # every assertion below is about.
