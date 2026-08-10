@@ -401,6 +401,66 @@ jobs:
       # submission declares, read from ONE file rather than written down twice. This step exists to
       # print that string where whoever fills in the form will see it, and to say plainly whether
       # the parameters are optional or mandatory for this build.
+      # CAN THE MSI BE INSTALLED PER-USER? Runs FIRST, on a clean machine, and removes itself, so
+      # the ordinary Exe flow below still measures a fresh box.
+      #
+      # Why this matters: the Exe puts files in %LOCALAPPDATA% and writes its uninstall entry to
+      # HKLM, which needs administrator rights, and it ignores ALLUSERS/MSIINSTALLPERUSER when they
+      # are passed to it. If msiexec honours those properties on the same underlying package, then
+      # the Store submission can ship the Msi with them declared and install for a standard user,
+      # which is what both rejections were actually about.
+      #
+      # Never fails the build. It is a measurement, and the Exe is still what the gates below judge.
+      - name: Can the MSI install per-user
+        if: ${{ inputs.package_url == '' }}
+        shell: pwsh
+        continue-on-error: true
+        working-directory: android
+        run: |
+          $msi = @(Get-ChildItem -Recurse -Filter *.msi -Path desktop/build/compose/binaries/main/msi -ErrorAction SilentlyContinue)
+          if ($msi.Count -ne 1) {
+            Write-Host "Expected exactly one msi, found $($msi.Count). Nothing to measure."
+            exit 0
+          }
+          $path = $msi[0].FullName
+          Write-Host "MSI: $path"
+
+          $log = "$env:RUNNER_TEMP\msi-peruser.log"
+          $p = Start-Process "msiexec.exe" -Wait -PassThru -ArgumentList @(
+            "/i", "`"$path`"", "/quiet", "/norestart", "ALLUSERS=2", "MSIINSTALLPERUSER=1", "/log", "`"$log`"")
+          Write-Host "msiexec exit code: $($p.ExitCode)"
+
+          function Entries($hive) {
+            Get-ChildItem $hive -ErrorAction SilentlyContinue |
+              ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+              Where-Object { $_.DisplayName -like "*Reveal*" }
+          }
+          $cu = Entries "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+          $lm = Entries "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+
+          if ($cu -and -not $lm) {
+            $verdict = "PER-USER. msiexec honours ALLUSERS=2 MSIINSTALLPERUSER=1. Submit the MSI with those parameters."
+          } elseif ($lm) {
+            $verdict = "STILL PER-MACHINE. The package itself hardcodes the scope; the MSI route does not help either."
+          } else {
+            $verdict = "Registered nothing. msiexec exit code was $($p.ExitCode); see the log."
+          }
+          Write-Host "RESULT: $verdict"
+          foreach ($e in @($cu) + @($lm)) { Write-Host "   $($e.DisplayName)  InstallLocation=$($e.InstallLocation)" }
+
+          if (-not ($cu -or $lm) -and (Test-Path $log)) {
+            Write-Host "--- tail of the msiexec log ---"
+            Get-Content $log -Tail 25 | ForEach-Object { Write-Host "  $_" }
+          }
+
+          @("", "### Can the MSI install per-user", "", $verdict) -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          # Leave the machine clean for the Exe gates below.
+          foreach ($e in @($cu) + @($lm)) {
+            if ($e.PSChildName) { Start-Process "msiexec.exe" -Wait -ArgumentList @("/x", $e.PSChildName, "/quiet", "/norestart") }
+          }
+          Start-Sleep -Seconds 5
+
       - name: Report the silent install contract
         id: installparams
         shell: pwsh
