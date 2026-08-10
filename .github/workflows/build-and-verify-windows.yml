@@ -82,6 +82,12 @@ jobs:
           repository: none298-dotcom/revealthedream
           ref: ${{ inputs.ref }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          # persist-credentials DEFAULTS TO TRUE, which writes PRIVATE_REPO_TOKEN into the
+          # workspace .git/config as an auth header, where it stays readable by every later step
+          # for the whole 8 minute job: the Gradle build, both PowerShell scripts, and anything
+          # they invoke. Nothing after this step uses git, so the token has no reason to outlive
+          # the checkout. Set false 2026-08-10 after a security audit.
+          persist-credentials: false
 
       - uses: actions/setup-java@v4
         with:
