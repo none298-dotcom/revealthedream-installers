@@ -924,6 +924,35 @@ jobs:
             -InstalledExe "${{ steps.installed.outputs.exe }}" `
             -RepoRoot "${{ github.workspace }}"
 
+      # App Lock (PLAN-APP-LOCK.md) is the one premium feature whose whole job is what is NOT on
+      # screen, so it is the one that most needs photographing rather than asserting. This shoots
+      # the door on a cold launch of the INSTALLED build, the mini window beside it, the app after
+      # the password is typed, and the settings card. Same discipline as every gate above: against
+      # the installed artifact, never a build run out of the source folder.
+      #
+      # Seeding goes through `--verify seed-app-lock`, which lives in the desktop module's `verify`
+      # source set. That set is wired onto `:desktop:run` and nothing else, so none of it exists
+      # inside the shipped EXE; VerifyHarnessAbsentTest asserts that against the compiled classes.
+      - name: Photograph the App Lock on the installed build
+        if: ${{ inputs.screenshots }}
+        shell: pwsh
+        run: |
+          ./tools/windows-app-lock-verify.ps1 `
+            -InstalledExe "${{ steps.installed.outputs.exe }}" `
+            -RepoRoot "${{ github.workspace }}" `
+            -OutputDir "$env:RUNNER_TEMP\app-lock-shots"
+
+      # `always()`, unlike the store screenshots above: if the lock step failed, the images it DID
+      # manage to take are the only way to tell "the lock is broken" from "the harness could not
+      # drive it", and those are different answers.
+      - name: Upload the App Lock screenshots
+        if: ${{ always() && inputs.screenshots }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-app-lock
+          path: ${{ runner.temp }}/app-lock-shots/*.png
+          if-no-files-found: warn
+
       - name: Upload the click-test screenshots
         if: ${{ always() && inputs.screenshots }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
