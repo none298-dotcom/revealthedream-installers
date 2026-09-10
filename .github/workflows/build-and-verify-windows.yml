@@ -953,6 +953,28 @@ jobs:
           path: ${{ runner.temp }}/app-lock-shots/*.png
           if-no-files-found: warn
 
+      # THE WINDOWS WIDGET, as far as this machine can go. The comment at the top of this file is
+      # right that Windows Server has no Widgets Board, so no runner can say whether the tile
+      # appears. It is wrong to stop there: the tile's CONTENT is an Adaptive Card built from the
+      # payload the installed app writes, and that can be composed and read anywhere.
+      #
+      # Runs after the seeding steps above, because it needs the payload a real journey produces.
+      - name: Verify the Windows widget card
+        if: ${{ inputs.screenshots }}
+        shell: pwsh
+        run: |
+          ./tools/windows-widget-card-verify.ps1 -OutputDir "$env:RUNNER_TEMP\widget-card"
+
+      # `always()`, like the App Lock shots: if the assertion failed, the composed card is the only
+      # thing that says WHAT the tile would have read, which is the question.
+      - name: Upload the widget card
+        if: ${{ always() && inputs.screenshots }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-widget-card
+          path: ${{ runner.temp }}/widget-card/*
+          if-no-files-found: warn
+
       - name: Upload the click-test screenshots
         if: ${{ always() && inputs.screenshots }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
