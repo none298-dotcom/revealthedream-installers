@@ -965,6 +965,39 @@ jobs:
         run: |
           ./tools/windows-widget-card-verify.ps1 -OutputDir "$env:RUNNER_TEMP\widget-card"
 
+      # THE TWO SETTINGS CARDS THIS MACHINE IS THE ONLY ONE THAT CAN JUDGE.
+      #
+      # Every screenshot step above photographs the INSTALLED build, which is the right discipline
+      # and leaves a gap: the store shots capture the Settings window at 1920x1080 scrolled to the
+      # top, and both the Journey length card and the free-tier Backup card sit below that fold. On
+      # 2026-09-10 both were changed (an emoji padlock became a drawn one, and the backup sentence
+      # became per platform because the shared one told a PC owner about their iPhone) and not one
+      # captured Windows image contained either of them.
+      #
+      # The desktop module renders those two cards headlessly through its own verify harness, so
+      # ask for them here. This runs from the SOURCE checkout rather than the installed EXE, on
+      # purpose and unavoidably: the verify source set is wired onto `:desktop:run` alone and is
+      # absent from the package by design, which `VerifyHarnessAbsentTest` asserts. What this step
+      # buys is the half a Mac cannot supply, which is these cards drawn by Windows itself, with
+      # Windows font rasterisation and Windows DPI, rather than by Skia on macOS.
+      - name: Render the settings cards on Windows
+        if: ${{ inputs.screenshots }}
+        shell: pwsh
+        working-directory: android
+        run: |
+          ./gradlew :desktop:run --console=plain --no-daemon `
+            "--args=--verify length-card $env:RUNNER_TEMP\settings-cards"
+          ./gradlew :desktop:run --console=plain --no-daemon `
+            "--args=--verify backup-screens $env:RUNNER_TEMP\settings-cards"
+
+      - name: Upload the settings cards
+        if: ${{ always() && inputs.screenshots }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-settings-cards
+          path: ${{ runner.temp }}/settings-cards/*.png
+          if-no-files-found: warn
+
       # `always()`, like the App Lock shots: if the assertion failed, the composed card is the only
       # thing that says WHAT the tile would have read, which is the question.
       - name: Upload the widget card
