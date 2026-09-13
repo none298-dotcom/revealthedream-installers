@@ -1084,8 +1084,23 @@ jobs:
           $sha = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
           Write-Host "Installer SHA256: $sha"
 
-          gh release download latest --repo ${{ github.repository }} --pattern latest.json --output latest.json --clobber
+          # READ THROUGH THE API, NEVER THE PUBLIC DOWNLOAD URL. The public
+          # releases/download/latest/latest.json sits behind a CDN that kept serving the previous
+          # copy for minutes after Mac 1.7.2 was published on 2026-09-13. A merge read from there
+          # writes that stale Mac entry back and silently undoes a Mac release. The asset API
+          # returns the stored bytes, and it is the same call the verification below uses, so the
+          # read and the check can never be looking at different copies.
+          $assetIdBefore = gh api "repos/${{ github.repository }}/releases/tags/latest" --jq '.assets[] | select(.name=="latest.json") | .id'
+          if (-not $assetIdBefore) { Write-Error "No latest.json asset on the latest release; refusing to write a manifest from nothing."; exit 1 }
+          gh api -H "Accept: application/octet-stream" "repos/${{ github.repository }}/releases/assets/$assetIdBefore" > latest.json
+          if ($LASTEXITCODE -ne 0) { Write-Error "Could not read latest.json through the API."; exit 1 }
           $manifest = Get-Content latest.json -Raw | ConvertFrom-Json
+
+          # THIS STEP OWNS ONLY THE win* KEYS. Snapshot every mac* key exactly as read, so the file on
+          # disk and the published copy can both be proven to carry them unchanged.
+          $macBefore = [ordered]@{}
+          foreach ($prop in $manifest.PSObject.Properties) { if ($prop.Name -like 'mac*') { $macBefore[$prop.Name] = $prop.Value } }
+          Write-Host "Mac keys as read: $(($macBefore.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', ')"
           # Add-Member -Force so this works whether or not winSha256 already exists on the object read
           # back from the release (older manifests do not have it).
           $manifest | Add-Member -NotePropertyName winSha256 -NotePropertyValue $sha -Force
@@ -1128,6 +1143,9 @@ jobs:
           if ($onDisk.winUrl -notlike "*$($asset.name)") { Write-Error "winUrl does not end in the asset name"; exit 1 }
           if ($onDisk.winSha256 -ne $sha) { Write-Error "Manifest on disk has the wrong winSha256. The write-back did not happen."; exit 1 }
           if ($onDisk.winSha256 -notmatch '^[0-9a-f]{64}$') { Write-Error "winSha256 is not 64 hex characters: $($onDisk.winSha256)"; exit 1 }
+          foreach ($k in $macBefore.Keys) {
+            if ("$($onDisk.$k)" -ne "$($macBefore[$k])") { Write-Error "Manifest on disk changed $k from '$($macBefore[$k])' to '$($onDisk.$k)'. This step must never touch Mac keys."; exit 1 }
+          }
 
           gh release upload latest latest.json --clobber --repo ${{ github.repository }}
 
@@ -1154,4 +1172,11 @@ jobs:
             Write-Error "PUBLISHED winSha256 is $($published.winSha256), expected $sha. The updater would refuse every download."
             exit 1
           }
+          foreach ($k in $macBefore.Keys) {
+            if ("$($published.$k)" -ne "$($macBefore[$k])") {
+              Write-Error "PUBLISHED manifest has $k='$($published.$k)', read as '$($macBefore[$k])'. The Windows publish changed a Mac entry."
+              exit 1
+            }
+          }
+          Write-Host "Mac keys unchanged in the published manifest: $($macBefore.Keys -join ', ')"
           Write-Host "Published manifest verified: winVersion $($published.winVersion), winSha256 $($published.winSha256), $($published.winUrl)"
