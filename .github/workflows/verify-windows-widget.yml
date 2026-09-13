@@ -212,6 +212,9 @@ jobs:
           Get-Process RevealWidgetProvider -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
           $type = [Type]::GetTypeFromCLSID([Guid]$clsid)
           $comObject = $null
+          # Event log entries are filtered from here, so a crash from an earlier run of the provider
+          # cannot fail (or pass) this one.
+          $activationStarted = Get-Date
           try {
             $comObject = [Activator]::CreateInstance($type)
             Write-Host "  CoCreateInstance {$clsid}: returned $($comObject.GetType().FullName)"
@@ -227,6 +230,26 @@ jobs:
             Write-Host "  provider pid $($pp.Id): $ppPath  package identity '$ppIdentity'"
             if ($ppIdentity -notlike 'LittleBirdTradingLLC.RevealTheDream.Widgets*') { $failures.Add("RevealWidgetProvider.exe (pid $($pp.Id)) runs without the widget package identity ('$ppIdentity').") }
             if ($ppPath -ne (Join-Path $providerDir 'RevealWidgetProvider.exe')) { $failures.Add("RevealWidgetProvider.exe ran from $ppPath, not from $providerDir.") }
+          }
+          if ($comObject) {
+            # STAYS UP. The provider waits for the host for as long as the host holds it, so a provider
+            # that registered and then fell over would pass the three-second look above. Look again
+            # later, and require the SAME process.
+            $firstIds = (@($providerProcs | ForEach-Object { $_.Id }) | Sort-Object) -join ','
+            Start-Sleep -Seconds 15
+            $laterProcs = @(Get-Process RevealWidgetProvider -ErrorAction SilentlyContinue)
+            $laterIds = (@($laterProcs | ForEach-Object { $_.Id }) | Sort-Object) -join ','
+            $upFor = if ($laterProcs.Count -gt 0) { [int]((Get-Date) - $laterProcs[0].StartTime).TotalSeconds } else { 0 }
+            Write-Host "  provider still running 18s after activation: pids $laterIds (was $firstIds), up ${upFor}s"
+            if ($laterProcs.Count -eq 0) { $failures.Add("RevealWidgetProvider.exe exited within 18s of activation (was pid $firstIds).") }
+            elseif ($laterIds -ne $firstIds) { $failures.Add("The provider process changed after activation ($firstIds -> $laterIds), so the first one died.") }
+          }
+          # NO CRASH. Both entries a .NET process leaves when it dies on an unhandled exception.
+          $crashes = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $activationStarted } -ErrorAction SilentlyContinue |
+            Where-Object { ($_.ProviderName -eq 'Application Error' -or $_.ProviderName -eq '.NET Runtime') -and $_.Message -like '*RevealWidgetProvider*' })
+          Write-Host "  Application log crash entries naming RevealWidgetProvider since activation: $($crashes.Count)"
+          foreach ($c in $crashes) {
+            $failures.Add("Application log [$($c.ProviderName) $($c.Id)] after activation: $(($c.Message -split "`r?`n" | Select-Object -First 6) -join ' | ')")
           }
           if (-not $comObject) {
             # A bare HRESULT says the server never registered its class, not why. Ask the provider
