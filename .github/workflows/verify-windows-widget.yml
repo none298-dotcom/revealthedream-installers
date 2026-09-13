@@ -1,0 +1,339 @@
+name: Verify the Windows widget Open action
+
+# PROVES WHAT THE WINDOWS 11 WIDGET'S "OPEN" BUTTON DOES, AND ITS PICKER IMAGE, AGAINST AN INSTALLED
+# BUILD.
+#
+# Its own workflow on purpose, so no two helpers edit the same file. It builds nothing: it installs
+# the SIGNED installer a build-and-verify-windows run already produced (`installer_run_id`), and
+# checks out the private source only for tools/windows-store-install-parameters.txt and
+# windows/WidgetProvider/AppLauncher.cs. Lives in this PUBLIC repo for the reason every workflow here
+# does: the source repo is private and billing blocked.
+#
+# No runner has a Widgets Board, so nothing here presses the real button. What CAN be proven is
+# everything the button does, from the context it does it in. AppLauncher.cs is compiled here from
+# the same source file the provider compiles, wrapped in a small harness, and run INSIDE the widget
+# package's identity with `Invoke-CommandInDesktopPackage -PreventBreakaway`, the worst case, where
+# every child process would otherwise inherit that identity.
+#
+#  1. The installed app registered the sparse widget package, and RevealWidgetProvider.exe sits in
+#     the external location the app passes (the parent of java.home, i.e. the install root). If
+#     either is wrong the Widgets Board has nothing to activate and there is no button at all.
+#  2. Assets\WidgetScreenshot.png inside the REGISTERED package is 300x304 with transparent corners,
+#     which is what Microsoft's widget picker guidelines ask for.
+#  3. Open with the app closed answers Launched, a "Reveal the Dream" window appears, and no app
+#     process carries the package identity. An app carrying it would write NEW AppData files to a
+#     per-package location the normally launched app never reads.
+#  4. Open with that window minimised answers Activated, restores it, and starts no process.
+#  5. Open with the app running HIDDEN (started with --background, as "Open at login" does) answers
+#     HandedToRunningCopy, the window appears through the single-instance handoff, and the process
+#     set is unchanged once the second launch has exited.
+#  6. CONTROL, so check 3 can fail: the same harness starting the app DIRECTLY, without the
+#     breakaway, must give an app that DOES carry the identity. If it does not, check 3 cannot tell
+#     the two cases apart, and the run says so and fails.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Private repo ref the installer was built from (for AppLauncher.cs and the install parameters)"
+        default: "main"
+        required: true
+      installer_run_id:
+        description: "Run id of a build-and-verify-windows run whose RevealTheDream-Windows-installer artifact to install"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    permissions:
+      contents: read
+      actions: read       # gh run download, for the other run's installer artifact
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out the PRIVATE source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/revealthedream
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - name: Download the signed installer from the build run
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "${{ inputs.installer_run_id }}" -R "${{ github.repository }}" -n RevealTheDream-Windows-installer -D "$env:RUNNER_TEMP\installer"
+          $found = @(Get-ChildItem "$env:RUNNER_TEMP\installer" -Filter *.exe)
+          if ($found.Count -ne 1) { Write-Error "Expected one installer in run ${{ inputs.installer_run_id }}, found $($found.Count)"; exit 1 }
+          $sig = Get-AuthenticodeSignature $found[0].FullName
+          Write-Host "Installer: $($found[0].Name)  signature: $($sig.Status)  $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { Write-Error "The installer's signature is $($sig.Status)."; exit 1 }
+          "installer=$($found[0].FullName)" >> $env:GITHUB_ENV
+
+      - name: Silent install with the declared parameters
+        shell: pwsh
+        run: |
+          $declared = (Get-Content "tools/windows-store-install-parameters.txt" -Raw).Trim() -split '\s+'
+          $log = "$env:RUNNER_TEMP\install.log"
+          $p = Start-Process $env:installer -Wait -PassThru -ArgumentList ($declared + @("/log", "`"$log`""))
+          Write-Host "Installer exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            if (Test-Path $log) { Get-Content $log -Tail 40 }
+            Write-Error "Install failed with $($p.ExitCode)"; exit 1
+          }
+          $exe = @(Get-ChildItem -Path $env:LOCALAPPDATA, $env:ProgramFiles -Filter "Reveal the Dream.exe" -Recurse -Depth 2 -ErrorAction SilentlyContinue) | Select-Object -First 1
+          if (-not $exe) { Write-Error "Installed, but Reveal the Dream.exe was not found."; exit 1 }
+          Write-Host "Installed executable: $($exe.FullName)"
+          "appExe=$($exe.FullName)" >> $env:GITHUB_ENV
+
+      # Windows PowerShell, not pwsh: the Appx cmdlets are Windows PowerShell modules.
+      - name: Prove the widget Open action and picker image
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = "$env:RUNNER_TEMP\widget-open"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $exe = $env:appExe
+          $installRoot = Split-Path $exe -Parent
+          $launcherSource = "windows/WidgetProvider/AppLauncher.cs"
+          if (-not (Test-Path $launcherSource)) { Write-Error "$launcherSource is not in ref '${{ inputs.ref }}'. Point ref at a commit that has the Open fix."; exit 1 }
+          $failures = New-Object System.Collections.Generic.List[string]
+
+          Add-Type -Namespace Proof -Name Win -MemberDefinition @'
+          [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+          [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+          [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern int GetPackageFullName(IntPtr process, ref uint length, System.Text.StringBuilder name);
+          [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+          [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+          public static string PackageOf(int pid) {
+            IntPtr h = OpenProcess(0x1000, false, pid);
+            if (h == IntPtr.Zero) return "<cannot open>";
+            try {
+              uint len = 0;
+              int rc = GetPackageFullName(h, ref len, null);
+              if (rc == 15700) return "";
+              var sb = new System.Text.StringBuilder((int)len + 1);
+              rc = GetPackageFullName(h, ref len, sb);
+              return rc == 0 ? sb.ToString() : "<error " + rc + ">";
+            } finally { CloseHandle(h); }
+          }
+          '@
+          Add-Type -AssemblyName System.Drawing, System.Windows.Forms
+
+          function App-Processes { @(Get-Process -ErrorAction SilentlyContinue | Where-Object { try { $_.Path -eq $exe } catch { $false } }) }
+          function App-Ids { (@(App-Processes | ForEach-Object { $_.Id }) | Sort-Object) -join ',' }
+          function Stop-App {
+            App-Processes | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+            $deadline = (Get-Date).AddSeconds(30)
+            while ((App-Processes).Count -gt 0 -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+          }
+          function Wait-MainWindow([int]$seconds) {
+            $deadline = (Get-Date).AddSeconds($seconds)
+            while ((Get-Date) -lt $deadline) {
+              $p = App-Processes | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -eq 'Reveal the Dream' } | Select-Object -First 1
+              if ($p) { return $p }
+              Start-Sleep -Seconds 1
+            }
+            return $null
+          }
+          function Save-Screen([string]$path) {
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $g.Dispose(); $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
+          }
+
+          Write-Host "==> Launch the installed app once, so it registers the widget package"
+          Start-Process -FilePath $exe | Out-Null
+          if (-not (Wait-MainWindow 150)) { Write-Error "The installed app showed no 'Reveal the Dream' window within 150s."; exit 1 }
+          $pkg = $null
+          $deadline = (Get-Date).AddSeconds(180)
+          while (-not $pkg -and (Get-Date) -lt $deadline) { $pkg = Get-AppxPackage -Name 'LittleBirdTradingLLC.RevealTheDream.Widgets'; if (-not $pkg) { Start-Sleep -Seconds 3 } }
+          Save-Screen "$out\first-launch.png"
+
+          Write-Host "==> 1. The widget package, and where the provider landed"
+          $providers = @(Get-ChildItem $installRoot -Recurse -Filter RevealWidgetProvider.exe -ErrorAction SilentlyContinue)
+          $msixes = @(Get-ChildItem $installRoot -Recurse -Filter RevealTheDreamWidgets.msix -ErrorAction SilentlyContinue)
+          Write-Host "  app:      $exe"
+          $providers | ForEach-Object { Write-Host "  provider: $($_.FullName)" }
+          $msixes | ForEach-Object { Write-Host "  msix:     $($_.FullName)" }
+          if ($providers.Count -ne 1) { Write-Error "Expected one RevealWidgetProvider.exe under $installRoot, found $($providers.Count)."; exit 1 }
+          $providerDir = $providers[0].DirectoryName
+          # WidgetPackageRegistration passes File(java.home).parentFile as -ExternalLocation, and
+          # java.home in a jpackage image is <install>\runtime, so the external location is the
+          # install root. The manifest names RevealWidgetProvider.exe relative to it.
+          if (-not (Test-Path (Join-Path $installRoot 'RevealWidgetProvider.exe'))) {
+            $failures.Add("RevealWidgetProvider.exe is not in the external location ($installRoot), it is in $providerDir. The Widgets Board could not activate the provider.")
+          }
+          if (-not $pkg) {
+            Write-Error "The widget package was not registered within 180s of launching the installed app. The app looks for RevealTheDreamWidgets.msix in $installRoot; the msix paths above say where it actually is."
+            exit 1
+          }
+          Write-Host "  package:  $($pkg.PackageFullName)"
+          Write-Host "  location: $($pkg.InstallLocation)"
+
+          Write-Host "==> 2. The picker image inside the registered package"
+          $shot = Join-Path $pkg.InstallLocation 'Assets\WidgetScreenshot.png'
+          if (-not (Test-Path $shot)) {
+            $failures.Add("No Assets\WidgetScreenshot.png in the registered package at $($pkg.InstallLocation).")
+          } else {
+            Copy-Item $shot "$out\WidgetScreenshot-registered.png"
+            $bmp = New-Object System.Drawing.Bitmap $shot
+            try {
+              $corners = @($bmp.GetPixel(0, 0).A, $bmp.GetPixel($bmp.Width - 1, 0).A, $bmp.GetPixel(0, $bmp.Height - 1).A, $bmp.GetPixel($bmp.Width - 1, $bmp.Height - 1).A)
+              Write-Host "  size $($bmp.Width)x$($bmp.Height), corner alpha $($corners -join ', ')"
+              if ($bmp.Width -ne 300 -or $bmp.Height -ne 304) { $failures.Add("The picker image is $($bmp.Width)x$($bmp.Height). Microsoft asks for 300x304.") }
+              if (($corners | Measure-Object -Maximum).Maximum -ne 0) { $failures.Add("The picker image corners are not transparent ($($corners -join ', ')).") }
+            } finally { $bmp.Dispose() }
+          }
+
+          Write-Host "==> Building the harness around AppLauncher.cs"
+          $harness = "$env:RUNNER_TEMP\widget-open-harness"
+          New-Item -ItemType Directory -Force -Path $harness | Out-Null
+          Copy-Item $launcherSource $harness
+          Set-Content -Path "$harness\Harness.csproj" -Value @'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0-windows</TargetFramework>
+              <Nullable>enable</Nullable>
+              <AssemblyName>WidgetOpenHarness</AssemblyName>
+            </PropertyGroup>
+          </Project>
+          '@
+          Set-Content -Path "$harness\Harness.cs" -Value @'
+          using System.Diagnostics;
+          using System.IO;
+          using System.Runtime.InteropServices;
+          using System.Text;
+          namespace RevealTheDream.Widgets
+          {
+              // args: <open|direct> <resultFile> <providerDir|appExe>. Writes the answer to a file,
+              // because a process started by Invoke-CommandInDesktopPackage has no console to read.
+              internal static class Harness
+              {
+                  [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+                  private static extern int GetCurrentPackageFullName(ref uint length, StringBuilder? name);
+
+                  private static string Identity()
+                  {
+                      uint length = 0;
+                      if (GetCurrentPackageFullName(ref length, null) == 15700) return "none";
+                      var name = new StringBuilder((int)length + 1);
+                      return GetCurrentPackageFullName(ref length, name) == 0 ? name.ToString() : "error";
+                  }
+
+                  private static int Main(string[] args)
+                  {
+                      string result;
+                      if (args[0] == "open") result = AppLauncher.OpenOrActivate(args[2]).ToString();
+                      else { Process.Start(new ProcessStartInfo(args[2]) { UseShellExecute = false })?.Dispose(); result = "StartedDirectly"; }
+                      File.WriteAllText(args[1], "IDENTITY=" + Identity() + "\nRESULT=" + result + "\n");
+                      return 0;
+                  }
+              }
+          }
+          '@
+          dotnet build "$harness\Harness.csproj" -c Release -nologo -o "$harness\bin" | Out-Host
+          if ($LASTEXITCODE -ne 0) { Write-Error "The harness around AppLauncher.cs did not compile."; exit 1 }
+          $harnessExe = "$harness\bin\WidgetOpenHarness.exe"
+
+          function Invoke-InWidgetPackage([string]$mode, [string]$resultFile, [string]$target) {
+            Remove-Item $resultFile -ErrorAction SilentlyContinue
+            Invoke-CommandInDesktopPackage -PackageFamilyName $pkg.PackageFamilyName -AppId 'RevealWidgetProvider' `
+              -Command $harnessExe -Args "$mode `"$resultFile`" `"$target`"" -PreventBreakaway | Out-Null
+            $deadline = (Get-Date).AddSeconds(60)
+            while (-not (Test-Path $resultFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+            if (-not (Test-Path $resultFile)) { throw "The harness never wrote $resultFile, so it never ran in the package context." }
+            $text = (Get-Content $resultFile -Raw).Trim()
+            Write-Host "  $mode -> $($text -replace "`r?`n", '  ')"
+            return $text
+          }
+
+          Write-Host "==> 3. Open with the app closed, from inside the widget package"
+          Stop-App
+          $cold = Invoke-InWidgetPackage 'open' "$out\open-cold.txt" $providerDir
+          if ($cold -notmatch 'IDENTITY=LittleBirdTradingLLC\.RevealTheDream\.Widgets') { $failures.Add("The harness did not run with the widget package identity ($cold), so checks 3 to 6 prove nothing.") }
+          if ($cold -notmatch 'RESULT=Launched') { $failures.Add("Open with the app closed answered: $cold") }
+          $win = Wait-MainWindow 150
+          if (-not $win) {
+            $failures.Add("No 'Reveal the Dream' window within 150s of Open.")
+          } else {
+            Start-Sleep -Seconds 5
+            foreach ($p in App-Processes) {
+              $identity = [Proof.Win]::PackageOf($p.Id)
+              Write-Host "  pid $($p.Id) package identity: '$identity'"
+              if ($identity -ne '') { $failures.Add("The app started by Open runs with package identity '$identity' (pid $($p.Id)).") }
+            }
+            Save-Screen "$out\3-open-cold.png"
+          }
+
+          Write-Host "==> 4. Open with the window minimised"
+          if ($win) {
+            $before = App-Ids
+            [void][Proof.Win]::ShowWindow($win.MainWindowHandle, 6)
+            Start-Sleep -Seconds 2
+            $warm = Invoke-InWidgetPackage 'open' "$out\open-minimised.txt" $providerDir
+            if ($warm -notmatch 'RESULT=Activated') { $failures.Add("Open with the window minimised answered: $warm") }
+            Start-Sleep -Seconds 10
+            $after = App-Ids
+            Write-Host "  app processes before: $before  after: $after"
+            if ($before -ne $after) { $failures.Add("Open on a minimised app changed its processes ($before -> $after).") }
+            if ([Proof.Win]::IsIconic($win.MainWindowHandle)) { $failures.Add("The window is still minimised after Open.") }
+            Save-Screen "$out\4-open-minimised.png"
+          }
+
+          Write-Host "==> 5. Open with the app running hidden (--background)"
+          Stop-App
+          Start-Process -FilePath $exe -ArgumentList '--background' | Out-Null
+          Start-Sleep -Seconds 20
+          if ((App-Processes).Count -eq 0) {
+            $failures.Add("The app did not stay running when started with --background, so the hidden case could not be tested.")
+          } elseif (Wait-MainWindow 1) {
+            $failures.Add("The app started with --background showed its main window, so this build has no background start and the hidden case could not be tested.")
+          } else {
+            $before = App-Ids
+            $hidden = Invoke-InWidgetPackage 'open' "$out\open-hidden.txt" $providerDir
+            if ($hidden -notmatch 'RESULT=HandedToRunningCopy') { $failures.Add("Open with the app running hidden answered: $hidden") }
+            $shown = Wait-MainWindow 30
+            if (-not $shown) { $failures.Add("Open with the app running hidden: no window appeared within 30s, so the single-instance handoff did not raise it.") }
+            Start-Sleep -Seconds 15
+            $after = App-Ids
+            Write-Host "  app processes before: $before  after: $after"
+            if ($before -ne $after) { $failures.Add("Open on a hidden running app left its processes changed ($before -> $after), so a second copy kept running.") }
+            Save-Screen "$out\5-open-hidden.png"
+          }
+
+          Write-Host "==> 6. Control: the app started directly from inside the package, with no breakaway"
+          Stop-App
+          [void](Invoke-InWidgetPackage 'direct' "$out\control.txt" $exe)
+          $controlWin = Wait-MainWindow 150
+          if (-not $controlWin) {
+            $failures.Add("Control: the app started directly showed no window, so check 3 has no control.")
+          } else {
+            $identities = @(App-Processes | ForEach-Object { [Proof.Win]::PackageOf($_.Id) })
+            Write-Host "  control identities: $($identities -join ' | ')"
+            if (-not ($identities | Where-Object { $_ -like 'LittleBirdTradingLLC.RevealTheDream.Widgets*' })) {
+              $failures.Add("Control: an app started WITHOUT the breakaway shows no package identity either, so check 3 cannot tell the two apart.")
+            }
+          }
+          Stop-App
+
+          if ($failures.Count -gt 0) {
+            $failures | ForEach-Object { Write-Host "::error::$_" }
+            exit 1
+          }
+          Write-Host "ok: Open launches the app outside the widget package, restores a minimised window, raises a hidden copy through the handoff without a second one, and the picker image is 300x304 with transparent corners"
+
+      - name: Upload the proof
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-widget-open
+          path: ${{ runner.temp }}/widget-open/*
+          if-no-files-found: warn
