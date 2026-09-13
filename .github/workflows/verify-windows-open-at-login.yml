@@ -1,0 +1,753 @@
+name: Verify Windows Open at login
+
+# PROVES "OPEN AT LOGIN" AND THE SINGLE-INSTANCE GUARD ON THE INSTALLED APP, ON A WINDOWS RUNNER.
+#
+# Lives in this PUBLIC repo for the same reason as the other two workflows: the source repo is
+# private and billing blocked. Its own file, so it never collides with changes to those.
+#
+# ONE JOB, UNSIGNED, AND THAT IS A DECISION. Nothing under test reads a signature: the Run value,
+# StartupApproved, the file lock and window visibility behave identically for a signed and an unsigned
+# build. Skipping signing means no job in this workflow can ever hold an Azure OIDC session, so the
+# job that runs Gradle has `contents: read` and nothing else, which is the split the updater workflow
+# exists to keep. The build is the real jpackage EXE, installed silently per user, and every check
+# runs against that installed launcher.
+#
+# THE VERSION IS PINNED TO ONE NO MANIFEST OFFERS (9.9.9), so the in-app updater can never put its
+# window over Settings and swallow the clicks this workflow makes.
+#
+# COMPOSE DESKTOP HAS NO UIA TREE, so the switch is found by its pixels (the countdown switch above it
+# is on by default and draws the sage primary; Open at login is the next switch below) and clicked by
+# coordinates. Nothing is concluded from pixels alone: every step asserts the registry, the instance
+# lock, the process list or the process's own top-level windows.
+#
+# Steps, numbered as proposed with the feature:
+#   1-2  nothing registered; Settings draws the switch off
+#   3-4  toggling on writes REG_SZ "<installed exe>" --background, exactly
+#   5    launching THAT STRING through CreateProcess (what sign-in does) starts with no main window,
+#        the saved mini window, the instance lock held, and a tray icon
+#   6    a second --background launch exits quietly; a second normal launch shows the running copy
+#   7    Windows' StartupApproved switch-off (first byte 03) reads as off; switching on clears it.
+#        Task Manager is asked for its own reading of 02 and 03, best effort, logged.
+#   8    toggling off removes the Run value and the StartupApproved entry
+#   9    launch repairs a value naming a launcher that is gone, and leaves another existing copy alone
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Private repo branch, tag or SHA to build"
+        default: "main"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    permissions:
+      contents: read
+    runs-on: windows-2022
+    timeout-minutes: 75
+    env:
+      PIN_VERSION: "9.9.9"
+
+    steps:
+      - name: Check out the PRIVATE source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/revealthedream
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Pin a version no update manifest offers
+        shell: pwsh
+        run: |
+          (Get-Content android/desktop/build.gradle.kts) -replace 'packageVersion = "[^"]+"', "packageVersion = `"$env:PIN_VERSION`"" | Set-Content android/desktop/build.gradle.kts
+          (Get-Content android/desktop/src/main/kotlin/com/revealthedream/desktop/Main.kt) -replace 'APP_VERSION = "[^"]+"', "APP_VERSION = `"$env:PIN_VERSION`"" | Set-Content android/desktop/src/main/kotlin/com/revealthedream/desktop/Main.kt
+
+      - name: Build the installer (unsigned)
+        working-directory: android
+        run: ./gradlew :desktop:packageExe --console=plain --no-daemon
+
+      - name: Install it silently, per user, as a customer would
+        shell: pwsh
+        run: |
+          $installer = @(Get-ChildItem -Recurse -Filter *.exe -Path android/desktop/build/compose/binaries/main/exe)[0]
+          Write-Host "Installer: $($installer.FullName)"
+          $p = Start-Process -FilePath $installer.FullName -ArgumentList '/quiet', '/norestart' -Wait -PassThru
+          Write-Host "Installer exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Write-Error "install failed: $($p.ExitCode)"; exit 1 }
+
+      - name: Locate the installed launcher
+        id: installed
+        shell: pwsh
+        run: |
+          $found = @(Get-ChildItem -Path $env:LOCALAPPDATA -Filter "Reveal the Dream.exe" -Recurse -Depth 2 -ErrorAction SilentlyContinue)
+          if ($found.Count -lt 1) { Write-Error "the installed launcher was not found under $env:LOCALAPPDATA"; exit 1 }
+          $exe = $found[0].FullName
+          Write-Host "Installed launcher: $exe"
+          Set-Content -LiteralPath "$env:RUNNER_TEMP\rtd-exe.txt" -Value $exe -Encoding utf8
+          "exe=$exe" >> $env:GITHUB_OUTPUT
+
+      # A journey, so Settings has the countdown switch and the card below it. Same user, same
+      # %APPDATA%, so the installed app reads what the harness wrote.
+      - name: Seed a journey through the harness
+        working-directory: android
+        run: |
+          ./gradlew :desktop:run --console=plain --no-daemon "--args=--verify onboard"
+          if (-not (Test-Path "$env:APPDATA\RevealTheDream\app-state-v1.json")) { Write-Error "no app state was written"; exit 1 }
+
+      - name: Write the UI and registry helpers
+        shell: pwsh
+        run: |
+          @'
+          using System;
+          using System.Collections.Generic;
+          using System.Drawing;
+          using System.Drawing.Imaging;
+          using System.Runtime.InteropServices;
+          using System.Text;
+          using System.Threading;
+
+          namespace Rtd
+          {
+              [StructLayout(LayoutKind.Sequential)]
+              public struct RECT { public int L; public int T; public int R; public int B; }
+
+              public class Win
+              {
+                  public IntPtr H; public string Title; public RECT Rect; public int Pid;
+                  public override string ToString() { return string.Format("'{0}' pid {1} {2}x{3} at {4},{5}", Title, Pid, Rect.R - Rect.L, Rect.B - Rect.T, Rect.L, Rect.T); }
+              }
+
+              public class Switch
+              {
+                  public int X; public int Y; public int Height; public bool On;
+                  public override string ToString() { return string.Format("{0} at {1},{2} h{3}", On ? "ON" : "off", X, Y, Height); }
+              }
+
+              public static class Ui
+              {
+                  public delegate bool EnumProc(IntPtr h, IntPtr p);
+                  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
+                  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+                  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
+                  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+                  [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+                  [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int a, out RECT r, int s);
+                  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+                  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+                  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
+                  [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+                  [DllImport("user32.dll")] static extern void mouse_event(uint flags, int dx, int dy, int data, IntPtr extra);
+
+                  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+                  struct STARTUPINFO { public int cb; public string lpReserved; public string lpDesktop; public string lpTitle; public int dwX; public int dwY; public int dwXSize; public int dwYSize; public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute; public int dwFlags; public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError; }
+                  [StructLayout(LayoutKind.Sequential)]
+                  struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public int dwProcessId; public int dwThreadId; }
+                  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+                  static extern bool CreateProcessW(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+                  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+
+                  public static string LastScan = "";
+
+                  // No application name: CreateProcess splits the raw command line itself, so an
+                  // unquoted path with a space would start the wrong thing, exactly as at sign-in.
+                  public static int StartCommandLine(string commandLine, string cwd)
+                  {
+                      var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+                      PROCESS_INFORMATION pi;
+                      if (!CreateProcessW(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, false, 0, IntPtr.Zero, cwd, ref si, out pi))
+                          throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                      CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+                      return pi.dwProcessId;
+                  }
+
+                  public static List<Win> Windows(int[] pids, bool visibleOnly)
+                  {
+                      var set = new HashSet<int>(pids);
+                      var list = new List<Win>();
+                      EnumProc cb = delegate (IntPtr h, IntPtr p)
+                      {
+                          uint pid; GetWindowThreadProcessId(h, out pid);
+                          if (!set.Contains((int)pid)) return true;
+                          if (visibleOnly && !IsWindowVisible(h)) return true;
+                          var sb = new StringBuilder(512); GetWindowTextW(h, sb, sb.Capacity);
+                          list.Add(new Win { H = h, Title = sb.ToString(), Rect = Bounds(h), Pid = (int)pid });
+                          return true;
+                      };
+                      EnumWindows(cb, IntPtr.Zero);
+                      GC.KeepAlive(cb);
+                      return list;
+                  }
+
+                  public static RECT Bounds(IntPtr h)
+                  {
+                      RECT r;
+                      if (DwmGetWindowAttribute(h, 9, out r, Marshal.SizeOf(typeof(RECT))) != 0) GetWindowRect(h, out r);
+                      return r;
+                  }
+
+                  public static Bitmap Capture(RECT r)
+                  {
+                      int w = Math.Max(1, r.R - r.L), h = Math.Max(1, r.B - r.T);
+                      var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+                      using (var g = Graphics.FromImage(bmp)) g.CopyFromScreen(r.L, r.T, 0, 0, new Size(w, h));
+                      return bmp;
+                  }
+
+                  public static void SaveRect(RECT r, string path) { using (var b = Capture(r)) b.Save(path, ImageFormat.Png); }
+
+                  public static void SaveScreen(string path)
+                  {
+                      var r = new RECT(); r.R = GetSystemMetrics(0); r.B = GetSystemMetrics(1);
+                      SaveRect(r, path);
+                  }
+
+                  public static void SaveCrop(Bitmap bmp, int y0, int y1, string path)
+                  {
+                      y0 = Math.Max(0, y0); y1 = Math.Min(bmp.Height, y1);
+                      using (var part = bmp.Clone(new Rectangle(0, y0, bmp.Width, Math.Max(1, y1 - y0)), bmp.PixelFormat)) part.Save(path, ImageFormat.Png);
+                  }
+
+                  public static void Click(int x, int y)
+                  {
+                      SetCursorPos(x, y); Thread.Sleep(250);
+                      mouse_event(0x0002, 0, 0, 0, IntPtr.Zero); Thread.Sleep(80);
+                      mouse_event(0x0004, 0, 0, 0, IntPtr.Zero);
+                  }
+
+                  public static void Wheel(int x, int y, int notches)
+                  {
+                      SetCursorPos(x, y); Thread.Sleep(120);
+                      mouse_event(0x0800, 0, 0, -120 * notches, IntPtr.Zero);
+                  }
+
+                  static bool Near(Color c, int r, int g, int b, int tol)
+                  {
+                      return Math.Abs(c.R - r) <= tol && Math.Abs(c.G - g) <= tol && Math.Abs(c.B - b) <= tol;
+                  }
+
+                  // Measured from the desktop module's own render of this card: a checked switch draws
+                  // a 20px thumb in the sage primary 4f7866 over a tinted track; an unchecked one draws
+                  // a white thumb over a NEUTRAL a4a7a3 track about 14px tall.
+                  public static List<Switch> FindSwitches(Bitmap bmp)
+                  {
+                      int w = bmp.Width, h = bmp.Height;
+                      int x0 = Math.Max(0, w - 140), x1 = w - 2;
+                      var sageRun = new int[h]; var sageMid = new int[h];
+                      var grayRun = new int[h]; var grayMid = new int[h];
+                      for (int y = 0; y < h; y++)
+                      {
+                          int run = 0, best = 0, bestEnd = 0, grun = 0, gbest = 0, gEnd = 0;
+                          for (int x = x0; x < x1; x++)
+                          {
+                              Color c = bmp.GetPixel(x, y);
+                              if (Near(c, 0x4f, 0x78, 0x66, 14)) { run++; if (run > best) { best = run; bestEnd = x; } } else run = 0;
+                              bool neutral = Math.Abs(c.R - c.G) <= 8 && Math.Abs(c.G - c.B) <= 8;
+                              if (neutral && Near(c, 0xa4, 0xa7, 0xa3, 14)) { grun++; if (grun > gbest) { gbest = grun; gEnd = x; } } else grun = 0;
+                          }
+                          sageRun[y] = best; sageMid[y] = bestEnd - best / 2;
+                          grayRun[y] = gbest; grayMid[y] = gEnd - gbest / 2;
+                      }
+                      var found = new List<Switch>();
+                      Collect(found, sageRun, sageMid, 10, 12, 28, true, h);
+                      Collect(found, grayRun, grayMid, 8, 8, 20, false, h);
+                      found.Sort((a, b) => a.Y.CompareTo(b.Y));
+                      var merged = new List<Switch>();
+                      foreach (var s in found)
+                      {
+                          if (merged.Count > 0 && Math.Abs(merged[merged.Count - 1].Y - s.Y) < 14) { if (s.On) merged[merged.Count - 1] = s; continue; }
+                          merged.Add(s);
+                      }
+                      return merged;
+                  }
+
+                  static void Collect(List<Switch> into, int[] runs, int[] mids, int minRun, int minH, int maxH, bool on, int h)
+                  {
+                      int start = -1; long midSum = 0;
+                      for (int y = 0; y <= h; y++)
+                      {
+                          bool hit = y < h && runs[y] >= minRun;
+                          if (hit) { if (start < 0) { start = y; midSum = 0; } midSum += mids[y]; continue; }
+                          if (start >= 0)
+                          {
+                              int height = y - start;
+                              if (height >= minH && height <= maxH)
+                                  into.Add(new Switch { X = (int)(midSum / height), Y = start + height / 2, Height = height, On = on });
+                              start = -1;
+                          }
+                      }
+                  }
+
+                  static string Describe(List<Switch> all)
+                  {
+                      var sb = new StringBuilder();
+                      foreach (var s in all) sb.Append(s.ToString()).Append("; ");
+                      return sb.ToString();
+                  }
+
+                  // The countdown switch is on by default and is the first switch on the page; Open at
+                  // login is the next switch below it, one short section further down.
+                  public static Switch FindOpenAtLogin(Bitmap bmp)
+                  {
+                      var all = FindSwitches(bmp);
+                      LastScan = Describe(all);
+                      for (int i = 0; i + 1 < all.Count; i++)
+                      {
+                          var a = all[i]; var b = all[i + 1];
+                          int dy = b.Y - a.Y;
+                          if (a.On && dy >= 60 && dy <= 260 && a.Y > 50 && b.Y < bmp.Height - 30) return b;
+                      }
+                      return null;
+                  }
+
+                  // A sage switch with room below it and nothing under it: the card is still loading
+                  // (a disabled switch draws lighter), so wait rather than scroll past it.
+                  public static bool LoneSageWithRoom(Bitmap bmp)
+                  {
+                      var all = FindSwitches(bmp);
+                      for (int i = 0; i < all.Count; i++)
+                      {
+                          var a = all[i];
+                          if (!a.On || a.Y <= 50 || a.Y >= bmp.Height - 300) continue;
+                          if (i + 1 >= all.Count || all[i + 1].Y - a.Y > 260) return true;
+                      }
+                      return false;
+                  }
+              }
+          }
+          '@ | Set-Content -LiteralPath "$env:RUNNER_TEMP\rtd-ui.cs" -Encoding utf8
+
+          @'
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.Drawing, System.Windows.Forms, UIAutomationClient, UIAutomationTypes
+          if (-not ('Rtd.Ui' -as [type])) { Add-Type -Path "$env:RUNNER_TEMP\rtd-ui.cs" -ReferencedAssemblies System.Drawing, System.Windows.Forms }
+
+          $Exe = (Get-Content -LiteralPath "$env:RUNNER_TEMP\rtd-exe.txt" -Raw).Trim()
+          $Canonical = '"' + $Exe + '" --background'
+          $RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run'
+          $ApprovedKey = 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
+          $ValueName = 'Reveal the Dream'
+          $Shots = "$env:RUNNER_TEMP\open-at-login"
+          New-Item -ItemType Directory -Force -Path $Shots | Out-Null
+          $LockFile = Join-Path $env:APPDATA 'RevealTheDream\instance.lock'
+          $MiniFile = Join-Path $env:APPDATA 'RevealTheDream\widget\mini-windows.txt'
+          $SettingsTitle = 'Settings - Reveal the Dream'
+
+          function Get-RunValue {
+            $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($RunKey)
+            if (-not $k) { return $null }
+            try {
+              $v = $k.GetValue($ValueName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+              if ($null -eq $v) { return $null }
+              return [pscustomobject]@{ Text = [string]$v; Kind = $k.GetValueKind($ValueName).ToString() }
+            } finally { $k.Close() }
+          }
+
+          function Get-ApprovedHex {
+            $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($ApprovedKey)
+            if (-not $k) { return $null }
+            try {
+              $v = $k.GetValue($ValueName, $null)
+              if ($null -eq $v) { return $null }
+              return (($v | ForEach-Object { $_.ToString('x2') }) -join '')
+            } finally { $k.Close() }
+          }
+
+          function Set-RunValueRaw([string]$Text) {
+            $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($RunKey)
+            $k.SetValue($ValueName, $Text, [Microsoft.Win32.RegistryValueKind]::String); $k.Close()
+          }
+
+          function Set-ApprovedBytes([byte[]]$Bytes) {
+            $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($ApprovedKey)
+            $k.SetValue($ValueName, $Bytes, [Microsoft.Win32.RegistryValueKind]::Binary); $k.Close()
+          }
+
+          function Get-AppPids { @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Exe } | ForEach-Object { $_.Id }) }
+
+          function Stop-App {
+            Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Exe } | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+            $deadline = (Get-Date).AddSeconds(30)
+            while (@(Get-AppPids).Count -gt 0 -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+            if (@(Get-AppPids).Count -gt 0) { throw "the app would not stop" }
+            Start-Sleep -Seconds 2
+          }
+
+          function Get-AppWindows {
+            $ids = @(Get-AppPids)
+            if ($ids.Count -eq 0) { return @() }
+            return @([Rtd.Ui]::Windows([int[]]$ids, $true) | Where-Object { $_.Title -and ($_.Rect.R - $_.Rect.L) -gt 50 })
+          }
+          function Get-MainWindows { @(Get-AppWindows | Where-Object { $_.Title -eq 'Reveal the Dream' -or $_.Title -like '* - Reveal the Dream' }) }
+          function Get-MiniWindows { @(Get-AppWindows | Where-Object { $_.Title -like '* - Reveal mini' }) }
+
+          function Show-AppWindows([string]$Label) {
+            $w = @(Get-AppWindows)
+            Write-Host "${Label}: $($w.Count) visible titled window(s), $(@(Get-AppPids).Count) process(es) running $Exe"
+            foreach ($x in $w) { Write-Host "  $x" }
+          }
+
+          function Wait-Until([scriptblock]$Condition, [int]$Seconds) {
+            $deadline = (Get-Date).AddSeconds($Seconds)
+            while ((Get-Date) -lt $deadline) { if (& $Condition) { return $true }; Start-Sleep -Milliseconds 700 }
+            return [bool](& $Condition)
+          }
+
+          # Java takes an OS lock over the whole file; a .NET lock on its first byte conflicts with it.
+          function Test-LockHeld {
+            if (-not (Test-Path -LiteralPath $LockFile)) { return 'absent' }
+            $fs = $null
+            try { $fs = [System.IO.File]::Open($LockFile, 'Open', 'ReadWrite', 'ReadWrite') } catch { return "unopenable: $($_.Exception.Message)" }
+            try { $fs.Lock(0, 1); $fs.Unlock(0, 1); return 'free' } catch [System.IO.IOException] { return 'held' } finally { $fs.Dispose() }
+          }
+
+          function Wait-ForWindow([string]$Title, [int]$Seconds) {
+            $deadline = (Get-Date).AddSeconds($Seconds)
+            while ((Get-Date) -lt $deadline) {
+              $w = @(Get-AppWindows | Where-Object { $_.Title -eq $Title })
+              if ($w.Count -gt 0) { return $w[0] }
+              Start-Sleep -Milliseconds 800
+            }
+            Show-AppWindows "no '$Title' after ${Seconds}s"
+            throw "no window titled '$Title'"
+          }
+
+          function Open-Settings {
+            Stop-App
+            Start-Process -FilePath $Exe -ArgumentList '--open', 'settings' | Out-Null
+            $null = Wait-ForWindow $SettingsTitle 120
+            Start-Sleep -Seconds 12
+          }
+
+          function Ensure-Settings {
+            if (@(Get-AppWindows | Where-Object { $_.Title -eq $SettingsTitle }).Count -gt 0) { return }
+            Open-Settings
+          }
+
+          function Find-OpenAtLoginSwitch {
+            $win = Wait-ForWindow $SettingsTitle 60
+            [void][Rtd.Ui]::ShowWindow($win.H, 9)
+            [void][Rtd.Ui]::SetForegroundWindow($win.H)
+            $r = $win.Rect
+            $width = $r.R - $r.L; $height = $r.B - $r.T
+            [Rtd.Ui]::Click($r.L + [int]($width / 2), $r.T + 14)
+            Start-Sleep -Milliseconds 700
+            $waits = 0
+            for ($i = 0; $i -lt 60; $i++) {
+              $bmp = [Rtd.Ui]::Capture($r)
+              try {
+                $sw = [Rtd.Ui]::FindOpenAtLogin($bmp)
+                if ($sw) {
+                  Write-Host "  switch found (pass $i): $sw   scan: $([Rtd.Ui]::LastScan)"
+                  return [pscustomobject]@{ Window = $win; Switch = $sw; ScreenX = $r.L + $sw.X; ScreenY = $r.T + $sw.Y }
+                }
+                $lone = [Rtd.Ui]::LoneSageWithRoom($bmp)
+              } finally { $bmp.Dispose() }
+              if ($lone -and $waits -lt 20) { $waits++; Start-Sleep -Seconds 1; continue }
+              [Rtd.Ui]::Wheel($r.L + [int]($width / 3), $r.T + [int]($height / 2), 2)
+              Start-Sleep -Milliseconds 600
+            }
+            [Rtd.Ui]::SaveRect($r, "$Shots\debug-switch-not-found.png")
+            throw "could not find the Open at login switch; last scan: $([Rtd.Ui]::LastScan)"
+          }
+
+          function Save-Card([string]$Name) {
+            $f = Find-OpenAtLoginSwitch
+            $bmp = [Rtd.Ui]::Capture($f.Window.Rect)
+            try { [Rtd.Ui]::SaveCrop($bmp, $f.Switch.Y - 60, $f.Switch.Y + 170, "$Shots\$Name") } finally { $bmp.Dispose() }
+            Write-Host "  saved $Name ($($f.Switch))"
+            return $f
+          }
+
+          function Wait-SwitchState([bool]$On, [int]$Seconds) {
+            $deadline = (Get-Date).AddSeconds($Seconds)
+            while ((Get-Date) -lt $deadline) {
+              $f = Find-OpenAtLoginSwitch
+              if ($f.Switch.On -eq $On) { return $f }
+              Start-Sleep -Seconds 1
+            }
+            throw "the switch never drew On=$On"
+          }
+
+          function New-Rect($r) {
+            $x = New-Object Rtd.RECT
+            $x.L = [int]$r.X; $x.T = [int]$r.Y; $x.R = [int]($r.X + $r.Width); $x.B = [int]($r.Y + $r.Height)
+            return $x
+          }
+
+          function Get-TrayButtonNames {
+            $AE = [System.Windows.Automation.AutomationElement]
+            $buttons = New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
+            $names = @()
+            foreach ($cls in @('Shell_TrayWnd', 'NotifyIconOverflowWindow')) {
+              $cond = New-Object System.Windows.Automation.PropertyCondition($AE::ClassNameProperty, $cls)
+              $wnd = $AE::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond)
+              if (-not $wnd) { continue }
+              foreach ($b in $wnd.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttons)) { $names += "${cls}: $($b.Current.Name)" }
+            }
+            return $names
+          }
+
+          function Open-TrayOverflow {
+            $AE = [System.Windows.Automation.AutomationElement]
+            $tray = $AE::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Children, (New-Object System.Windows.Automation.PropertyCondition($AE::ClassNameProperty, 'Shell_TrayWnd')))
+            if (-not $tray) { return $null }
+            $chevron = $tray.FindFirst([System.Windows.Automation.TreeScope]::Descendants, (New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, 'Notification Chevron')))
+            if (-not $chevron) { Write-Host "  no Notification Chevron button"; return $null }
+            $chevron.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+            Start-Sleep -Seconds 2
+            return $AE::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Children, (New-Object System.Windows.Automation.PropertyCondition($AE::ClassNameProperty, 'NotifyIconOverflowWindow')))
+          }
+
+          # Windows' own reading of StartupApproved, where Task Manager offers one. Never fails a step.
+          function Read-TaskManagerStartup([string]$Label) {
+            try {
+              Get-Process Taskmgr -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+              Start-Process taskmgr.exe -ArgumentList '/0', '/startup' | Out-Null
+              Start-Sleep -Seconds 8
+              $p = Get-Process Taskmgr -ErrorAction SilentlyContinue | Select-Object -First 1
+              if (-not $p) { Write-Host "Task Manager (${Label}): did not start"; return }
+              $AE = [System.Windows.Automation.AutomationElement]
+              $win = $AE::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Children, (New-Object System.Windows.Automation.PropertyCondition($AE::ProcessIdProperty, $p.Id)))
+              if (-not $win) { Write-Host "Task Manager (${Label}): no window"; return }
+              [Rtd.Ui]::SaveRect((New-Rect $win.Current.BoundingRectangle), "$Shots\taskmgr-$Label.png")
+              $hits = @()
+              foreach ($e in $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) {
+                $n = $e.Current.Name
+                if ($n -and $n -like '*Reveal the Dream*') { $hits += $e }
+              }
+              Write-Host "Task Manager (${Label}): $($hits.Count) element(s) naming Reveal the Dream"
+              foreach ($e in $hits) {
+                $texts = @()
+                foreach ($k in $e.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) { if ($k.Current.Name) { $texts += $k.Current.Name } }
+                Write-Host "  [$($e.Current.ControlType.ProgrammaticName)] '$($e.Current.Name)' -> $($texts -join ' | ')"
+              }
+            } catch {
+              Write-Host "Task Manager (${Label}): $($_.Exception.Message)"
+            } finally {
+              Get-Process Taskmgr -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 1
+            }
+          }
+          '@ | Set-Content -LiteralPath "$env:RUNNER_TEMP\rtd-oal.ps1" -Encoding utf8
+
+      - name: Resize the display
+        shell: powershell
+        run: |
+          . "$env:RUNNER_TEMP\rtd-oal.ps1"
+          try { Set-DisplayResolution -Width 1920 -Height 1080 -Force -ErrorAction Stop | Out-Null } catch { Write-Host "Set-DisplayResolution reported: $_" }
+          Start-Sleep -Seconds 3
+          Write-Host "Display is $([Rtd.Ui]::GetSystemMetrics(0))x$([Rtd.Ui]::GetSystemMetrics(1))"
+
+      - name: "1-2: nothing is registered, and Settings draws the switch off"
+        shell: powershell
+        run: |
+          . "$env:RUNNER_TEMP\rtd-oal.ps1"
+          Stop-App
+          $run = Get-RunValue; $approved = Get-ApprovedHex
+          Write-Host "Before: Run value = $(if ($run) { $run.Text } else { '<absent>' }); StartupApproved = $(if ($approved) { $approved } else { '<absent>' })"
+          if ($run) { throw "a Run value exists before the switch was ever pressed" }
+          if ($approved) { throw "a StartupApproved entry exists before the switch was ever pressed" }
+          Open-Settings
+          Show-AppWindows 'Settings launch'
+          $f = Save-Card '1-settings-off.png'
+          if ($f.Switch.On) { throw "the switch draws ON with no Run value" }
+          [Rtd.Ui]::SaveRect($f.Window.Rect, "$Shots\1-settings-window.png")
+
+      - name: "3-4: switching on writes the quoted launcher and --background"
+        shell: powershell
+        run: |
+          . "$env:RUNNER_TEMP\rtd-oal.ps1"
+          Ensure-Settings
+          $f = Find-OpenAtLoginSwitch
+          if ($f.Switch.On) { throw "expected the switch off before pressing it" }
+          [Rtd.Ui]::Click($f.ScreenX, $f.ScreenY)
+          if (-not (Wait-Until { $null -ne (Get-RunValue) } 60)) { throw "pressing the switch wrote no Run value" }
+          $run = Get-RunValue
+          Write-Host "Run value: [$($run.Text)]  kind: $($run.Kind)"
+          Write-Host "Expected:  [$Canonical]"
+          Set-Content -LiteralPath "$Shots\run-value.txt" -Value $run.Text -Encoding UTF8
+          if ($run.Kind -ne 'String') { throw "the Run value is $($run.Kind), expected String (REG_SZ)" }
+          if (-not ($run.Text -ceq $Canonical)) { throw "the Run value is not the quoted installed launcher plus --background" }
+          Start-Sleep -Seconds 6
+          $null = Wait-SwitchState $true 60
+          $null = Save-Card '2-settings-on.png'
+
+      - name: "5: the sign-in command starts in the tray with no main window"
+        shell: powershell
+        run: |
+          . "$env:RUNNER_TEMP\rtd-oal.ps1"
+          Stop-App
+          $lock = Test-LockHeld
+          Write-Host "Instance lock with nothing running: $lock"
+          if ($lock -eq 'held') { throw "the lock is held with no app running" }
+          $run = Get-RunValue
+          if (-not $run) { throw "no Run value to launch" }
+          Write-Host "CreateProcess with the Run value, unmodified: $($run.Text)"
+          $launched = [Rtd.Ui]::StartCommandLine($run.Text, "$env:SystemRoot\System32")
+          Write-Host "Started pid $launched"
+          if (-not (Wait-Until { @(Get-AppPids).Count -gt 0 } 60)) { throw "nothing is running from $Exe" }
+          Start-Sleep -Seconds 35
+          Show-AppWindows 'Sign-in launch'
+          $ids = @(Get-AppPids)
+          Write-Host "Process sessions: $((Get-Process -Id $ids | ForEach-Object { $_.SessionId } | Sort-Object -Unique) -join ', '); this step's session: $((Get-Process -Id $PID).SessionId)"
+
+          $main = @(Get-MainWindows)
+          if ($main.Count -gt 0) { throw "a --background start showed the main window: $($main -join '; ')" }
+          $lock = Test-LockHeld
+          Write-Host "Instance lock: $lock"
+          if ($lock -ne 'held') { throw "the running app does not hold the instance lock ($lock)" }
+
+          $pins = if (Test-Path -LiteralPath $MiniFile) { (Get-Content -LiteralPath $MiniFile -Raw) } else { '' }
+          if ($null -eq $pins) { $pins = '' }
+          Write-Host "mini-windows.txt: [$($pins.Trim())]"
+          $minis = @(Get-MiniWindows)
+          if ($pins.Trim()) {
+            if ($minis.Count -lt 1) { throw "the saved mini window did not open on a background start" }
+          } elseif ($minis.Count -gt 0) {
+            throw "a mini window opened that was not saved as open"
+          }
+
+          $names = @(Get-TrayButtonNames)
+          $mine = @($names | Where-Object { $_ -like '*Reveal the Dream*' })
+          $sw = [Rtd.Ui]::GetSystemMetrics(0); $sh = [Rtd.Ui]::GetSystemMetrics(1)
+          $area = New-Object Rtd.RECT; $area.L = $sw - 700; $area.T = $sh - 70; $area.R = $sw; $area.B = $sh
+          [Rtd.Ui]::SaveRect($area, "$Shots\3-taskbar-tray.png")
+          if ($mine.Count -eq 0) {
+            $ov = Open-TrayOverflow
+            if ($ov) {
+              $r = $ov.Current.BoundingRectangle
+              $pad = New-Object Rtd.RECT; $pad.L = [int]$r.X - 20; $pad.T = [int]$r.Y - 20; $pad.R = $sw; $pad.B = $sh
+              [Rtd.Ui]::SaveRect($pad, "$Shots\3-tray-overflow.png")
+            }
+            $names = @(Get-TrayButtonNames)
+            $mine = @($names | Where-Object { $_ -like '*Reveal the Dream*' })
+            [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+          }
+          Write-Host "Tray buttons seen: $($names -join ' || ')"
+          [Rtd.Ui]::SaveScreen("$Shots\3-background-start-screen.png")
+          if ($mine.Count -eq 0) { throw "no tray icon named Reveal the Dream" }
+          Write-Host "Tray icon: $($mine -join ', ')"
+
+      - name: "6: a second launch hands over to the running copy"
+        shell: powershell
+        run: |
+          . "$env:RUNNER_TEMP\rtd-oal.ps1"
+          $before = @(Get-AppPids | Sort-Object)
+          Write-Host "Running before: $($before.Count) process(es): $($before -join ', ')"
+          if ($before.Count -eq 0) { throw "the background-started app is not running" }
+          if (@(Get-MainWindows).Count -gt 0) { throw "a main window is already visible" }
+
+          $p = Start-Process -FilePath $Exe -ArgumentList '--background' -PassThru
+          if (-not $p.WaitForExit(90000)) { throw "a second --background launch did not exit" }
+          Write-Host "Second --background launch exited, code $($p.ExitCode)"
+          if (-not (Wait-Until { @(Get-AppPids).Count -eq $before.Count } 60)) { Show-AppWindows 'after --background'; throw "a second copy is still running after a --background launch" }
+          Start-Sleep -Seconds 5
+          if (@(Get-MainWindows).Count -gt 0) { throw "a second --background launch popped the main window" }
+          Write-Host "Second --background launch: exited quietly, no window, $(@(Get-AppPids).Count) process(es)"
+
+          $p2 = Start-Process -FilePath $Exe -PassThru
+          if (-not $p2.WaitForExit(90000)) { throw "a second normal launch did not exit" }
+          Write-Host "Second normal launch exited, code $($p2.ExitCode)"
+          if (-not (Wait-Until { @(Get-MainWindows).Count -gt 0 } 30)) { Show-AppWindows 'after second launch'; throw "the running copy did not show its window" }
+          if (-not (Wait-Until { @(Get-AppPids).Count -eq $before.Count } 60)) { throw "a second copy is still running" }
+          Start-Sleep -Seconds 4
+          Show-AppWindows 'After second normal launch'
+          $after = @(Get-AppPids | Sort-Object)
+          if (($after -join ',') -ne ($before -join ',')) { throw "the running processes changed: before $($before -join ','), after $($after -join ',')" }
+          $lock = Test-LockHeld
+          if ($lock -ne 'held') { throw "the lock is $lock after the handoff" }
+          [Rtd.Ui]::SaveScreen("$Shots\4-second-launch-shows-the-running-copy.png")
+
+      - name: "7: a Startup apps switch-off reads as off, and switching on clears it"
+        shell: powershell
+        run: |
+          . "$env:RUNNER_TEMP\rtd-oal.ps1"
+          Stop-App
+          $run = Get-RunValue
+          if (-not $run -or -not ($run.Text -ceq $Canonical)) { throw "this step needs the Run value from step 4" }
+          $stamp = [BitConverter]::GetBytes([DateTime]::UtcNow.ToFileTimeUtc())
+          Set-ApprovedBytes ([byte[]](@(2, 0, 0, 0) + $stamp))
+          Write-Host "StartupApproved = $(Get-ApprovedHex)"
+          Read-TaskManagerStartup 'bytes-02'
+          Set-ApprovedBytes ([byte[]](@(3, 0, 0, 0) + $stamp))
+          Write-Host "StartupApproved = $(Get-ApprovedHex)"
+          Read-TaskManagerStartup 'bytes-03'
+
+          Open-Settings
+          $f = Save-Card '5-turned-off-in-windows.png'
+          if ($f.Switch.On) { throw "with StartupApproved 03 the switch still draws ON" }
+          [Rtd.Ui]::Click($f.ScreenX, $f.ScreenY)
+          if (-not (Wait-Until { $null -eq (Get-ApprovedHex) } 60)) { throw "switching on did not clear the switch-off record: $(Get-ApprovedHex)" }
+          $run = Get-RunValue
+          if (-not $run -or -not ($run.Text -ceq $Canonical)) { throw "the Run value changed: $($run.Text)" }
+          Write-Host "StartupApproved entry removed, Run value unchanged"
+          Start-Sleep -Seconds 6
+          $null = Wait-SwitchState $true 60
+          $null = Save-Card '6-switched-back-on.png'
+
+      - name: "8: switching off removes the Run value"
+        shell: powershell
+        run: |
+          . "$env:RUNNER_TEMP\rtd-oal.ps1"
+          Ensure-Settings
+          $f = Find-OpenAtLoginSwitch
+          if (-not $f.Switch.On) { throw "expected the switch on before switching it off" }
+          [Rtd.Ui]::Click($f.ScreenX, $f.ScreenY)
+          if (-not (Wait-Until { ($null -eq (Get-RunValue)) -and ($null -eq (Get-ApprovedHex)) } 60)) { throw "switching off left Run=$((Get-RunValue).Text) StartupApproved=$(Get-ApprovedHex)" }
+          Write-Host "Run value and StartupApproved entry are both absent"
+          Start-Sleep -Seconds 6
+          $null = Wait-SwitchState $false 60
+          $null = Save-Card '7-settings-off-again.png'
+
+      - name: "9: launch repairs a value naming a launcher that is gone, and leaves another copy alone"
+        shell: powershell
+        run: |
+          . "$env:RUNNER_TEMP\rtd-oal.ps1"
+          Stop-App
+          $gone = 'C:\Gone\Reveal the Dream.exe'
+          if (Test-Path -LiteralPath $gone) { throw "$gone exists" }
+          Set-RunValueRaw ('"' + $gone + '" --background')
+          Start-Process -FilePath $Exe | Out-Null
+          if (-not (Wait-Until { $v = Get-RunValue; ($null -ne $v) -and ($v.Text -ceq $Canonical) } 120)) { throw "launch did not repair the stale value; it is now [$((Get-RunValue).Text)]" }
+          Write-Host "Repaired to: $((Get-RunValue).Text)"
+
+          Stop-App
+          $other = '"' + "$env:SystemRoot\System32\notepad.exe" + '" --background'
+          Set-RunValueRaw $other
+          Start-Process -FilePath $Exe | Out-Null
+          $null = Wait-ForWindow 'Reveal the Dream' 120
+          Start-Sleep -Seconds 45
+          $v = Get-RunValue
+          Write-Host "A value naming another launcher that exists, after launch: [$($v.Text)]"
+          if (-not $v -or -not ($v.Text -ceq $other)) { throw "launch rewrote a value naming another existing launcher" }
+          Stop-App
+
+      - name: Remove the Run and StartupApproved values, and stop the app
+        if: always()
+        shell: powershell
+        run: |
+          Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*\Reveal the Dream\Reveal the Dream.exe' } | Stop-Process -Force -ErrorAction SilentlyContinue
+          Get-Process Taskmgr -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          $name = 'Reveal the Dream'
+          foreach ($path in @('Software\Microsoft\Windows\CurrentVersion\Run', 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run')) {
+            $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($path, $true)
+            if ($k) { $k.DeleteValue($name, $false); $left = $k.GetValue($name, $null); $k.Close(); if ($null -ne $left) { Write-Error "HKCU\$path still has '$name'"; exit 1 } }
+          }
+          Write-Host "No '$name' value remains under Run or StartupApproved\Run"
+
+      - name: Upload the screenshots and the Run value
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-open-at-login
+          path: ${{ runner.temp }}/open-at-login/*
+          if-no-files-found: warn
