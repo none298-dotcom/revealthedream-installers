@@ -238,6 +238,8 @@ jobs:
           $out = & ./gradlew ':desktop:run' '--console=plain' '-q' "--args=--verify update-selftest $env:RUNNER_TEMP\m-tampered.json '${{ steps.installed.outputs.exe }}' '${{ steps.fixtures.outputs.tampered }}' --negative sha" 2>&1 | Out-String
           Write-Host $out
           if ($out -notmatch 'VERIFY_UPDATE:refused-as-expected') { Write-Error "tampered installer was not refused"; exit 1 }
+          # The SPECIFIC refusal, or a broken check that refuses everything would pass this gate.
+          if ($out -notmatch 'refused-as-expected message=The downloaded file did not match the published update') { Write-Error "refused, but not by the hash check"; exit 1 }
 
       - name: Negative - a foreign-signed installer is refused
         working-directory: android
@@ -250,6 +252,8 @@ jobs:
           $out = & ./gradlew ':desktop:run' '--console=plain' '-q' "--args=--verify update-selftest $env:RUNNER_TEMP\m-foreign.json '${{ steps.installed.outputs.exe }}' '${{ steps.fixtures.outputs.foreign }}' --negative cert" 2>&1 | Out-String
           Write-Host $out
           if ($out -notmatch 'VERIFY_UPDATE:refused-as-expected') { Write-Error "foreign-signed installer was not refused"; exit 1 }
+          # The SPECIFIC refusal. Run 34763108409 passed this step with 'Windows could not confirm who signed', a signature check that could not run at all.
+          if ($out -notmatch 'refused-as-expected message=The downloaded file is not signed by Little Bird Trading LLC') { Write-Error "refused, but not by the publisher check"; exit 1 }
 
       - name: Both negatives left the installed version untouched
         shell: pwsh
