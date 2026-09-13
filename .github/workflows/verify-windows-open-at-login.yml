@@ -537,11 +537,31 @@ jobs:
             throw "could not find the Open at login switch; last scan: $([Rtd.Ui]::LastScan)"
           }
 
+          # The card's text and its notice line sit BELOW the switch, and Find stops as soon as the
+          # switch itself is in view, which can be the window's last row. Run 34774951440 photographed
+          # the Windows switch-off state with its notice cut off that way, byte-identical to plain off.
+          # So scroll one notch at a time until the switch has room under it, stepping back if the
+          # countdown switch it is anchored to leaves the top.
           function Save-Card([string]$Name) {
             $f = Find-OpenAtLoginSwitch
+            $r = $f.Window.Rect
+            $width = $r.R - $r.L; $height = $r.B - $r.T
+            for ($i = 0; $i -lt 8 -and $f.Switch.Y -gt ($height - 240); $i++) {
+              [Rtd.Ui]::Wheel($r.L + [int]($width / 3), $r.T + [int]($height / 2), 1)
+              Start-Sleep -Milliseconds 800
+              $bmp = [Rtd.Ui]::Capture($r)
+              try { $sw = [Rtd.Ui]::FindOpenAtLogin($bmp) } finally { $bmp.Dispose() }
+              if (-not $sw) {
+                [Rtd.Ui]::Wheel($r.L + [int]($width / 3), $r.T + [int]($height / 2), -1)
+                Start-Sleep -Milliseconds 800
+                break
+              }
+              $f = [pscustomobject]@{ Window = $f.Window; Switch = $sw; ScreenX = $r.L + $sw.X; ScreenY = $r.T + $sw.Y }
+            }
+            $f = Find-OpenAtLoginSwitch
             $bmp = [Rtd.Ui]::Capture($f.Window.Rect)
-            try { [Rtd.Ui]::SaveCrop($bmp, $f.Switch.Y - 60, $f.Switch.Y + 170, "$Shots\$Name") } finally { $bmp.Dispose() }
-            Write-Host "  saved $Name ($($f.Switch))"
+            try { [Rtd.Ui]::SaveCrop($bmp, $f.Switch.Y - 60, $f.Switch.Y + 230, "$Shots\$Name") } finally { $bmp.Dispose() }
+            Write-Host "  saved $Name ($($f.Switch), window height $height)"
             return $f
           }
 
@@ -571,18 +591,52 @@ jobs:
             return $true
           }
 
+          function Start-TaskManager([string[]]$Arguments) {
+            if ($Arguments -and $Arguments.Count) { Start-Process taskmgr.exe -ArgumentList $Arguments | Out-Null } else { Start-Process taskmgr.exe | Out-Null }
+            $deadline = (Get-Date).AddSeconds(25)
+            while ((Get-Date) -lt $deadline) {
+              $p = Get-Process Taskmgr -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
+              if ($p) { [void][Rtd.Ui]::SetForegroundWindow($p.MainWindowHandle); Start-Sleep -Seconds 3; return $p.MainWindowHandle }
+              Start-Sleep -Milliseconds 700
+            }
+            return [IntPtr]::Zero
+          }
+
           # Windows' own reading of StartupApproved, where Task Manager offers one. Never fails a step.
           function Read-TaskManagerStartup([string]$Label) {
             try {
               Get-Process Taskmgr -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-              Start-Process taskmgr.exe -ArgumentList '/0', '/startup' | Out-Null
-              Start-Sleep -Seconds 8
-              $p = Get-Process Taskmgr -ErrorAction SilentlyContinue | Select-Object -First 1
-              if (-not $p) { Write-Host "Task Manager (${Label}): did not start"; return }
               $AE = [System.Windows.Automation.AutomationElement]
-              $win = $AE::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Children, (New-Object System.Windows.Automation.PropertyCondition($AE::ProcessIdProperty, $p.Id)))
-              if (-not $win) { Write-Host "Task Manager (${Label}): no window"; return }
-              [Rtd.Ui]::SaveRect((New-Rect $win.Current.BoundingRectangle), "$Shots\taskmgr-$Label.png")
+              # A fresh profile opens Task Manager in its compact view, which has no Startup tab at all:
+              # run 34774951440 photographed exactly that. Expand it once; the view persists.
+              $hwnd = Start-TaskManager -Arguments @()
+              if ($hwnd -ne [IntPtr]::Zero) {
+                $r = [Rtd.Ui]::Bounds($hwnd)
+                $more = $AE::FromHandle($hwnd).FindFirst([System.Windows.Automation.TreeScope]::Descendants, (New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, 'More details')))
+                if ($more) {
+                  $mr = $more.Current.BoundingRectangle
+                  [Rtd.Ui]::Click([int]($mr.X + $mr.Width / 2), [int]($mr.Y + $mr.Height / 2))
+                  Write-Host "Task Manager (${Label}): pressed More details"
+                } else {
+                  [Rtd.Ui]::Click($r.L + 60, $r.B - 22)
+                  Write-Host "Task Manager (${Label}): no More details element, clicked where it sits"
+                }
+                Start-Sleep -Seconds 3
+              }
+              Get-Process Taskmgr -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 2
+              $hwnd = Start-TaskManager -Arguments @('/0', '/startup')
+              if ($hwnd -eq [IntPtr]::Zero) { Write-Host "Task Manager (${Label}): no window"; return }
+              $win = $AE::FromHandle($hwnd)
+              $tab = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants, (New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, 'Startup')))
+              if ($tab) {
+                $tr = $tab.Current.BoundingRectangle
+                [Rtd.Ui]::Click([int]($tr.X + $tr.Width / 2), [int]($tr.Y + $tr.Height / 2))
+                Start-Sleep -Seconds 4
+              } else {
+                Write-Host "Task Manager (${Label}): no Startup tab element"
+              }
+              [Rtd.Ui]::SaveRect([Rtd.Ui]::Bounds($hwnd), "$Shots\taskmgr-$Label.png")
               # Exact name only. A walk of every descendant can take minutes, and UI Automation already
               # saw nothing in the taskbar on this image, so this reading is a bonus, never the proof.
               $byName = New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, 'Reveal the Dream')
@@ -687,6 +741,7 @@ jobs:
           $opened = Open-TrayOverflow
           $owners = @([Rtd.Ui]::TrayIconOwnerPids())
           Write-Host "Tray: $([Rtd.Ui]::LastTray)"
+          Write-Host "Tray icon owners: $((@($owners | Sort-Object -Unique) | ForEach-Object { "$_=$((Get-Process -Id $_ -ErrorAction SilentlyContinue).ProcessName)" }) -join ', ')"
           if ($opened) {
             $ov = [Rtd.Ui]::OverflowRect()
             if (($ov.R - $ov.L) -gt 0) {
