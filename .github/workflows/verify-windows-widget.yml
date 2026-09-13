@@ -164,11 +164,14 @@ jobs:
           $msixes | ForEach-Object { Write-Host "  msix:     $($_.FullName)" }
           if ($providers.Count -ne 1) { Write-Error "Expected one RevealWidgetProvider.exe under $installRoot, found $($providers.Count)."; exit 1 }
           $providerDir = $providers[0].DirectoryName
-          # WidgetPackageRegistration passes File(java.home).parentFile as -ExternalLocation, and
-          # java.home in a jpackage image is <install>\runtime, so the external location is the
-          # install root. The manifest names RevealWidgetProvider.exe relative to it.
-          if (-not (Test-Path (Join-Path $installRoot 'RevealWidgetProvider.exe'))) {
-            $failures.Add("RevealWidgetProvider.exe is not in the external location ($installRoot), it is in $providerDir. The Widgets Board could not activate the provider.")
+          # WidgetPackageRegistration passes the directory it FOUND the MSIX in as -ExternalLocation
+          # (the Compose resources directory, <install>\app\resources, in an installed build), and the
+          # manifest names RevealWidgetProvider.exe relative to it. So the invariant is that the
+          # provider and the MSIX share one directory, whichever directory that is.
+          if ($msixes.Count -ne 1) {
+            $failures.Add("Expected one RevealTheDreamWidgets.msix under $installRoot, found $($msixes.Count).")
+          } elseif ($msixes[0].DirectoryName -ne $providerDir) {
+            $failures.Add("RevealWidgetProvider.exe is in $providerDir but the MSIX, whose directory becomes the external location, is in $($msixes[0].DirectoryName). The Widgets Board could not activate the provider.")
           }
           if (-not $pkg) {
             Write-Error "The widget package was not registered within 180s of launching the installed app. The app looks for RevealTheDreamWidgets.msix in $installRoot; the msix paths above say where it actually is."
