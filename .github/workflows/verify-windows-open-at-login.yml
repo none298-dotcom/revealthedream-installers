@@ -157,6 +157,84 @@ jobs:
 
                   public static string LastScan = "";
 
+                  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowW(string cls, string name);
+                  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string name);
+                  [DllImport("user32.dll")] static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
+                  [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+                  [DllImport("kernel32.dll")] static extern IntPtr VirtualAllocEx(IntPtr p, IntPtr addr, UIntPtr size, uint type, uint protect);
+                  [DllImport("kernel32.dll")] static extern bool VirtualFreeEx(IntPtr p, IntPtr addr, UIntPtr size, uint type);
+                  [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr p, IntPtr addr, byte[] buf, UIntPtr size, out UIntPtr read);
+
+                  // The notification area's two toolbars: the promoted one on the taskbar and the
+                  // overflow behind the chevron. UI Automation saw no buttons in either on this image.
+                  public static List<IntPtr> TrayToolbars()
+                  {
+                      var list = new List<IntPtr>();
+                      IntPtr tray = FindWindowW("Shell_TrayWnd", null);
+                      IntPtr notify = FindWindowExW(tray, IntPtr.Zero, "TrayNotifyWnd", null);
+                      IntPtr pager = FindWindowExW(notify, IntPtr.Zero, "SysPager", null);
+                      IntPtr promoted = FindWindowExW(pager, IntPtr.Zero, "ToolbarWindow32", null);
+                      if (promoted != IntPtr.Zero) list.Add(promoted);
+                      IntPtr overflow = FindWindowExW(FindWindowW("NotifyIconOverflowWindow", null), IntPtr.Zero, "ToolbarWindow32", null);
+                      if (overflow != IntPtr.Zero) list.Add(overflow);
+                      return list;
+                  }
+
+                  public static IntPtr TrayChevron()
+                  {
+                      IntPtr notify = FindWindowExW(FindWindowW("Shell_TrayWnd", null), IntPtr.Zero, "TrayNotifyWnd", null);
+                      return FindWindowExW(notify, IntPtr.Zero, "Button", null);
+                  }
+
+                  public static RECT OverflowRect()
+                  {
+                      RECT r = new RECT();
+                      IntPtr w = FindWindowW("NotifyIconOverflowWindow", null);
+                      if (w != IntPtr.Zero) GetWindowRect(w, out r);
+                      return r;
+                  }
+
+                  public static string LastTray = "";
+
+                  // The process that owns each tray icon. Each toolbar button's dwData points at the
+                  // shell's TRAYDATA inside explorer, whose first field is the window that registered
+                  // the icon, so reading it names the owner exactly: no tooltip text, no pixels.
+                  // x64 TBBUTTON: int, int, 2 bytes, 6 reserved, then dwData at offset 16.
+                  public static List<int> TrayIconOwnerPids()
+                  {
+                      var sb = new StringBuilder(); var pids = new List<int>();
+                      foreach (var tb in TrayToolbars())
+                      {
+                          uint explorerPid; GetWindowThreadProcessId(tb, out explorerPid);
+                          int count = (int)SendMessageW(tb, 0x0418, IntPtr.Zero, IntPtr.Zero);
+                          sb.AppendFormat("toolbar {0} (explorer pid {1}) has {2} button(s): ", tb, explorerPid, count);
+                          IntPtr proc = OpenProcess(0x0008 | 0x0010 | 0x0020 | 0x0400, false, (int)explorerPid);
+                          if (proc == IntPtr.Zero) { sb.Append("OpenProcess failed; "); continue; }
+                          IntPtr remote = VirtualAllocEx(proc, IntPtr.Zero, (UIntPtr)64, 0x1000 | 0x2000, 0x04);
+                          try
+                          {
+                              for (int i = 0; i < count; i++)
+                              {
+                                  SendMessageW(tb, 0x0417, (IntPtr)i, remote);
+                                  byte[] btn = new byte[32]; UIntPtr read;
+                                  if (!ReadProcessMemory(proc, remote, btn, (UIntPtr)32, out read)) { sb.Append("[read failed] "); continue; }
+                                  long data = BitConverter.ToInt64(btn, 16);
+                                  if (data == 0) continue;
+                                  byte[] td = new byte[16];
+                                  if (!ReadProcessMemory(proc, (IntPtr)data, td, (UIntPtr)16, out read)) { sb.Append("[tray data read failed] "); continue; }
+                                  IntPtr owner = (IntPtr)BitConverter.ToInt64(td, 0);
+                                  uint opid; GetWindowThreadProcessId(owner, out opid);
+                                  pids.Add((int)opid);
+                                  sb.AppendFormat("[#{0} owner pid {1}] ", i, opid);
+                              }
+                          }
+                          finally { VirtualFreeEx(proc, remote, UIntPtr.Zero, 0x8000); CloseHandle(proc); }
+                          sb.Append("; ");
+                      }
+                      LastTray = sb.ToString();
+                      return pids;
+                  }
+
                   // No application name: CreateProcess splits the raw command line itself, so an
                   // unquoted path with a space would start the wrong thing, exactly as at sign-in.
                   public static int StartCommandLine(string commandLine, string cwd)
@@ -483,28 +561,14 @@ jobs:
             return $x
           }
 
-          function Get-TrayButtonNames {
-            $AE = [System.Windows.Automation.AutomationElement]
-            $buttons = New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
-            $names = @()
-            foreach ($cls in @('Shell_TrayWnd', 'NotifyIconOverflowWindow')) {
-              $cond = New-Object System.Windows.Automation.PropertyCondition($AE::ClassNameProperty, $cls)
-              $wnd = $AE::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond)
-              if (-not $wnd) { continue }
-              foreach ($b in $wnd.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttons)) { $names += "${cls}: $($b.Current.Name)" }
-            }
-            return $names
-          }
-
+          # Clicks the "^" by its own window rectangle, so the overflow can be photographed.
           function Open-TrayOverflow {
-            $AE = [System.Windows.Automation.AutomationElement]
-            $tray = $AE::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Children, (New-Object System.Windows.Automation.PropertyCondition($AE::ClassNameProperty, 'Shell_TrayWnd')))
-            if (-not $tray) { return $null }
-            $chevron = $tray.FindFirst([System.Windows.Automation.TreeScope]::Descendants, (New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, 'Notification Chevron')))
-            if (-not $chevron) { Write-Host "  no Notification Chevron button"; return $null }
-            $chevron.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+            $chevron = [Rtd.Ui]::TrayChevron()
+            if ($chevron -eq [IntPtr]::Zero) { Write-Host "  no chevron button under TrayNotifyWnd"; return $false }
+            $r = [Rtd.Ui]::Bounds($chevron)
+            [Rtd.Ui]::Click([int](($r.L + $r.R) / 2), [int](($r.T + $r.B) / 2))
             Start-Sleep -Seconds 2
-            return $AE::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Children, (New-Object System.Windows.Automation.PropertyCondition($AE::ClassNameProperty, 'NotifyIconOverflowWindow')))
+            return $true
           }
 
           # Windows' own reading of StartupApproved, where Task Manager offers one. Never fails a step.
@@ -519,15 +583,14 @@ jobs:
               $win = $AE::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Children, (New-Object System.Windows.Automation.PropertyCondition($AE::ProcessIdProperty, $p.Id)))
               if (-not $win) { Write-Host "Task Manager (${Label}): no window"; return }
               [Rtd.Ui]::SaveRect((New-Rect $win.Current.BoundingRectangle), "$Shots\taskmgr-$Label.png")
-              $hits = @()
-              foreach ($e in $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) {
-                $n = $e.Current.Name
-                if ($n -and $n -like '*Reveal the Dream*') { $hits += $e }
-              }
-              Write-Host "Task Manager (${Label}): $($hits.Count) element(s) naming Reveal the Dream"
+              # Exact name only. A walk of every descendant can take minutes, and UI Automation already
+              # saw nothing in the taskbar on this image, so this reading is a bonus, never the proof.
+              $byName = New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, 'Reveal the Dream')
+              $hits = @($win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $byName))
+              Write-Host "Task Manager (${Label}): $($hits.Count) element(s) named Reveal the Dream"
               foreach ($e in $hits) {
                 $texts = @()
-                foreach ($k in $e.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) { if ($k.Current.Name) { $texts += $k.Current.Name } }
+                foreach ($k in $e.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)) { if ($k.Current.Name) { $texts += $k.Current.Name } }
                 Write-Host "  [$($e.Current.ControlType.ProgrammaticName)] '$($e.Current.Name)' -> $($texts -join ' | ')"
               }
             } catch {
@@ -616,26 +679,26 @@ jobs:
             throw "a mini window opened that was not saved as open"
           }
 
-          $names = @(Get-TrayButtonNames)
-          $mine = @($names | Where-Object { $_ -like '*Reveal the Dream*' })
           $sw = [Rtd.Ui]::GetSystemMetrics(0); $sh = [Rtd.Ui]::GetSystemMetrics(1)
           $area = New-Object Rtd.RECT; $area.L = $sw - 700; $area.T = $sh - 70; $area.R = $sw; $area.B = $sh
           [Rtd.Ui]::SaveRect($area, "$Shots\3-taskbar-tray.png")
-          if ($mine.Count -eq 0) {
-            $ov = Open-TrayOverflow
-            if ($ov) {
-              $r = $ov.Current.BoundingRectangle
-              $pad = New-Object Rtd.RECT; $pad.L = [int]$r.X - 20; $pad.T = [int]$r.Y - 20; $pad.R = $sw; $pad.B = $sh
-              [Rtd.Ui]::SaveRect($pad, "$Shots\3-tray-overflow.png")
+          [Rtd.Ui]::SaveScreen("$Shots\3-background-start-screen.png")
+
+          $opened = Open-TrayOverflow
+          $owners = @([Rtd.Ui]::TrayIconOwnerPids())
+          Write-Host "Tray: $([Rtd.Ui]::LastTray)"
+          if ($opened) {
+            $ov = [Rtd.Ui]::OverflowRect()
+            if (($ov.R - $ov.L) -gt 0) {
+              $pad = New-Object Rtd.RECT; $pad.L = [Math]::Max(0, $ov.L - 40); $pad.T = [Math]::Max(0, $ov.T - 40); $pad.R = $sw; $pad.B = $sh
+              [Rtd.Ui]::SaveRect($pad, "$Shots\3-tray-overflow-open.png")
             }
-            $names = @(Get-TrayButtonNames)
-            $mine = @($names | Where-Object { $_ -like '*Reveal the Dream*' })
             [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
           }
-          Write-Host "Tray buttons seen: $($names -join ' || ')"
-          [Rtd.Ui]::SaveScreen("$Shots\3-background-start-screen.png")
-          if ($mine.Count -eq 0) { throw "no tray icon named Reveal the Dream" }
-          Write-Host "Tray icon: $($mine -join ', ')"
+          $ids = @(Get-AppPids)
+          $mine = @($owners | Where-Object { $ids -contains $_ })
+          if ($mine.Count -eq 0) { throw "no notification-area icon is owned by the running app (app pids $($ids -join ', '); icon owners $($owners -join ', '))" }
+          Write-Host "Tray icon owned by app pid $($mine -join ', ')"
 
       - name: "6: a second launch hands over to the running copy"
         shell: powershell
