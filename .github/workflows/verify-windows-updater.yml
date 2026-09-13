@@ -313,19 +313,24 @@ jobs:
           }
           if (-not $running) { Write-Error "the app did not relaunch after the update"; exit 1 }
           Write-Host "Relaunched: $($running.ProcessName) pid $($running.Id) from $($running.Path)"
-          Stop-Process -Id $running.Id -Force -ErrorAction SilentlyContinue
 
-      - name: Screenshot the relaunched app
-        if: always()
-        shell: pwsh
-        run: |
-          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-          Start-Process "${{ steps.installed.outputs.exe }}"
+          # PHOTOGRAPH THE HELPER'S RELAUNCH, before it is stopped. The screenshot step below used to
+          # kill nothing and launch the app itself, so its image showed a manual launch and proved
+          # nothing about the updater. It also ran after the screenshot upload, so it never shipped.
           Start-Sleep -Seconds 12
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
           $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
           $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
-          [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
-          $bmp.Save("$env:RUNNER_TEMP\update-shots\relaunched.png")
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          $g.Dispose()
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\relaunch-shot" | Out-Null
+          $bmp.Save("$env:RUNNER_TEMP\relaunch-shot\relaunched-by-helper.png")
+          $bmp.Dispose()
+          $title = (Get-Process -Id $running.Id -ErrorAction SilentlyContinue).MainWindowTitle
+          $alive = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($appdir, [System.StringComparison]::OrdinalIgnoreCase) -and $_.MainWindowTitle }
+          Write-Host "Windows owned by the relaunched app: $(($alive | ForEach-Object { "'$($_.MainWindowTitle)' pid $($_.Id)" }) -join ', ')"
+          Stop-Process -Id $running.Id -Force -ErrorAction SilentlyContinue
 
       # The self-test runs the pipeline against a disposable work directory under TEMP, so the
       # helper's own log lands there. Collected for a human to read the wait/verify/install/relaunch
@@ -339,6 +344,14 @@ jobs:
             $log = Join-Path $_.FullName "update.log"
             if (Test-Path $log) { Copy-Item $log (Join-Path "$env:RUNNER_TEMP\update-logs" "$($_.Name).log") }
           }
+
+      - name: Upload the relaunch screenshot
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-update-relaunch
+          path: ${{ runner.temp }}/relaunch-shot/*.png
+          if-no-files-found: warn
 
       - name: Upload the update logs
         if: always()
