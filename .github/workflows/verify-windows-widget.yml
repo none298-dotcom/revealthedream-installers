@@ -198,6 +198,14 @@ jobs:
             $failures.Add("No Assets\WidgetScreenshot.png in the registered package at $($pkg.InstallLocation).")
           } else {
             Copy-Item $shot "$out\WidgetScreenshot-registered.png"
+            # THE SAME BYTES AS THE COMMITTED ASSET, compared against the checkout rather than a typed
+            # hash, so a later image change needs no edit here. A stale package that still happens to
+            # be 300x304 with clear corners would pass the size checks below and fail this one.
+            $registeredSha = (Get-FileHash $shot -Algorithm SHA256).Hash.ToLowerInvariant()
+            $committedSha = (Get-FileHash "windows/Package/Assets/WidgetScreenshot.png" -Algorithm SHA256).Hash.ToLowerInvariant()
+            Write-Host "  sha256 registered $registeredSha"
+            Write-Host "  sha256 committed  $committedSha"
+            if ($registeredSha -ne $committedSha) { $failures.Add("The picker image in the registered package ($registeredSha) is not the committed windows/Package/Assets/WidgetScreenshot.png ($committedSha).") }
             $bmp = New-Object System.Drawing.Bitmap $shot
             try {
               $corners = @($bmp.GetPixel(0, 0).A, $bmp.GetPixel($bmp.Width - 1, 0).A, $bmp.GetPixel(0, $bmp.Height - 1).A, $bmp.GetPixel($bmp.Width - 1, $bmp.Height - 1).A)
