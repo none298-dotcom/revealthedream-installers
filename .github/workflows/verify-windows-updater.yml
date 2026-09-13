@@ -235,7 +235,7 @@ jobs:
           $len = (Get-Item "${{ steps.high.outputs.installer }}").Length
           $manifest = @{ winVersion = $env:HIGH_VERSION; winUrl = "https://dl.revealthedream.com/windows/$env:HIGH_VERSION/RevealTheDream-Windows-Setup.exe"; winSha256 = $sha; winSizeBytes = $len } | ConvertTo-Json
           $manifest | Set-Content "$env:RUNNER_TEMP\m-tampered.json" -Encoding utf8
-          $out = & ./gradlew ':desktop:run' '--console=plain' '-q' "--args=--verify update-selftest $env:RUNNER_TEMP\m-tampered.json `"${{ steps.installed.outputs.exe }}`" `"${{ steps.fixtures.outputs.tampered }}`" --negative sha" 2>&1 | Out-String
+          $out = & ./gradlew ':desktop:run' '--console=plain' '-q' "--args=--verify update-selftest $env:RUNNER_TEMP\m-tampered.json '${{ steps.installed.outputs.exe }}' '${{ steps.fixtures.outputs.tampered }}' --negative sha" 2>&1 | Out-String
           Write-Host $out
           if ($out -notmatch 'VERIFY_UPDATE:refused-as-expected') { Write-Error "tampered installer was not refused"; exit 1 }
 
@@ -247,7 +247,7 @@ jobs:
           $len = (Get-Item "${{ steps.fixtures.outputs.foreign }}").Length
           $manifest = @{ winVersion = $env:HIGH_VERSION; winUrl = "https://dl.revealthedream.com/windows/$env:HIGH_VERSION/RevealTheDream-Windows-Setup.exe"; winSha256 = $sha; winSizeBytes = $len } | ConvertTo-Json
           $manifest | Set-Content "$env:RUNNER_TEMP\m-foreign.json" -Encoding utf8
-          $out = & ./gradlew ':desktop:run' '--console=plain' '-q' "--args=--verify update-selftest $env:RUNNER_TEMP\m-foreign.json `"${{ steps.installed.outputs.exe }}`" `"${{ steps.fixtures.outputs.foreign }}`" --negative cert" 2>&1 | Out-String
+          $out = & ./gradlew ':desktop:run' '--console=plain' '-q' "--args=--verify update-selftest $env:RUNNER_TEMP\m-foreign.json '${{ steps.installed.outputs.exe }}' '${{ steps.fixtures.outputs.foreign }}' --negative cert" 2>&1 | Out-String
           Write-Host $out
           if ($out -notmatch 'VERIFY_UPDATE:refused-as-expected') { Write-Error "foreign-signed installer was not refused"; exit 1 }
 
@@ -270,7 +270,7 @@ jobs:
           $len = (Get-Item "${{ steps.high.outputs.installer }}").Length
           $manifest = @{ winVersion = $env:HIGH_VERSION; winUrl = "https://dl.revealthedream.com/windows/$env:HIGH_VERSION/RevealTheDream-Windows-Setup.exe"; winSha256 = $sha; winSizeBytes = $len } | ConvertTo-Json
           $manifest | Set-Content "$env:RUNNER_TEMP\m-high.json" -Encoding utf8
-          $out = & ./gradlew ':desktop:run' '--console=plain' '-q' "--args=--verify update-selftest $env:RUNNER_TEMP\m-high.json `"${{ steps.installed.outputs.exe }}`" `"${{ steps.high.outputs.installer }}`"" 2>&1 | Out-String
+          $out = & ./gradlew ':desktop:run' '--console=plain' '-q' "--args=--verify update-selftest $env:RUNNER_TEMP\m-high.json '${{ steps.installed.outputs.exe }}' '${{ steps.high.outputs.installer }}'" 2>&1 | Out-String
           Write-Host $out
           if ($out -notmatch 'VERIFY_UPDATE:helper-started') { Write-Error "the pipeline did not start the installer"; exit 1 }
 
