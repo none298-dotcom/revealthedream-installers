@@ -228,6 +228,26 @@ jobs:
             if ($ppIdentity -notlike 'LittleBirdTradingLLC.RevealTheDream.Widgets*') { $failures.Add("RevealWidgetProvider.exe (pid $($pp.Id)) runs without the widget package identity ('$ppIdentity').") }
             if ($ppPath -ne (Join-Path $providerDir 'RevealWidgetProvider.exe')) { $failures.Add("RevealWidgetProvider.exe ran from $ppPath, not from $providerDir.") }
           }
+          if (-not $comObject) {
+            # A bare HRESULT says the server never registered its class, not why. Ask the provider
+            # directly: started by hand with the COM server switch it either stays up (registration
+            # worked, so the fault is in activation) or exits and says what killed it.
+            Write-Host "  diagnosis: starting RevealWidgetProvider.exe -RegisterProcessAsComServer directly"
+            $diagOut = "$out\provider-direct-stdout.txt"; $diagErr = "$out\provider-direct-stderr.txt"
+            $direct = Start-Process -FilePath (Join-Path $providerDir 'RevealWidgetProvider.exe') -ArgumentList '-RegisterProcessAsComServer' `
+              -RedirectStandardOutput $diagOut -RedirectStandardError $diagErr -PassThru
+            if ($direct.WaitForExit(10000)) {
+              Write-Host "  diagnosis: provider exited with code $($direct.ExitCode) within 10s"
+            } else {
+              Write-Host "  diagnosis: provider still running after 10s, so it registered; stopping it"
+              Stop-Process -Id $direct.Id -Force -ErrorAction SilentlyContinue
+            }
+            foreach ($f in @($diagOut, $diagErr)) { if ((Test-Path $f) -and (Get-Item $f).Length -gt 0) { Write-Host "  --- $(Split-Path $f -Leaf)"; Get-Content $f | Select-Object -First 40 | ForEach-Object { Write-Host "  $_" } } }
+            Write-Host "  diagnosis: Application event log entries naming RevealWidgetProvider in the last 15 minutes"
+            Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-15) } -ErrorAction SilentlyContinue |
+              Where-Object { $_.Message -like '*RevealWidgetProvider*' } | Select-Object -First 6 |
+              ForEach-Object { Write-Host "  [$($_.ProviderName) $($_.Id)] $(($_.Message -split "`r?`n" | Select-Object -First 25) -join ' | ')" }
+          }
           if ($comObject) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($comObject) }
           $providerProcs | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
 
