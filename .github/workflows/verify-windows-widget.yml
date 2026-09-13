@@ -30,6 +30,12 @@ name: Verify the Windows widget Open action
 #  6. CONTROL, so check 3 can fail: the same harness starting the app DIRECTLY, without the
 #     breakaway, must give an app that DOES carry the identity. If it does not, check 3 cannot tell
 #     the two cases apart, and the run says so and fails.
+#  7. The provider's COM class, declared by the package's windows.comServer extension, is registered
+#     and ACTIVATES: creating the CLSID starts RevealWidgetProvider.exe from the MSIX's folder with
+#     the widget package identity and hands back an object. This is how the Widgets host reaches the
+#     provider. What it does NOT prove, and no Windows Server runner can: that the Widgets Board lists
+#     the widget, draws the card, or delivers a real Open press to OnActionInvoked. That still needs a
+#     Windows 11 machine.
 
 on:
   workflow_dispatch:
@@ -179,6 +185,12 @@ jobs:
           }
           Write-Host "  package:  $($pkg.PackageFullName)"
           Write-Host "  location: $($pkg.InstallLocation)"
+          $pkg | Format-List * | Out-String | Write-Host
+          # The version must be the one this source declares, read from the manifest rather than
+          # typed here, so a later bump cannot leave this check asserting a stale number.
+          $expectedVersion = ([regex]::Match((Get-Content "windows/Package/AppxManifest.xml" -Raw), '<Identity\b[^>]*?\bVersion="([^"]+)"', 'Singleline')).Groups[1].Value
+          Write-Host "  version:  registered $($pkg.Version), manifest $expectedVersion"
+          if ([string]$pkg.Version -ne $expectedVersion) { $failures.Add("The registered widget package is version $($pkg.Version), but windows/Package/AppxManifest.xml declares $expectedVersion.") }
 
           Write-Host "==> 2. The picker image inside the registered package"
           $shot = Join-Path $pkg.InstallLocation 'Assets\WidgetScreenshot.png'
@@ -194,6 +206,30 @@ jobs:
               if (($corners | Measure-Object -Maximum).Maximum -ne 0) { $failures.Add("The picker image corners are not transparent ($($corners -join ', ')).") }
             } finally { $bmp.Dispose() }
           }
+
+          Write-Host "==> 7. The provider's COM class is registered and activates"
+          $clsid = 'A6C2F0E4-9B31-4E7D-8A55-2F1C6D9E30B7'
+          Get-Process RevealWidgetProvider -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+          $type = [Type]::GetTypeFromCLSID([Guid]$clsid)
+          $comObject = $null
+          try {
+            $comObject = [Activator]::CreateInstance($type)
+            Write-Host "  CoCreateInstance {$clsid}: returned $($comObject.GetType().FullName)"
+          } catch {
+            $failures.Add("Activating the widget provider's COM class {$clsid} failed: $($_.Exception.Message)")
+          }
+          Start-Sleep -Seconds 3
+          $providerProcs = @(Get-Process RevealWidgetProvider -ErrorAction SilentlyContinue)
+          if ($comObject -and $providerProcs.Count -eq 0) { $failures.Add("The COM class activated but no RevealWidgetProvider.exe is running.") }
+          foreach ($pp in $providerProcs) {
+            $ppPath = try { $pp.Path } catch { '<unreadable>' }
+            $ppIdentity = [Proof.Win]::PackageOf($pp.Id)
+            Write-Host "  provider pid $($pp.Id): $ppPath  package identity '$ppIdentity'"
+            if ($ppIdentity -notlike 'LittleBirdTradingLLC.RevealTheDream.Widgets*') { $failures.Add("RevealWidgetProvider.exe (pid $($pp.Id)) runs without the widget package identity ('$ppIdentity').") }
+            if ($ppPath -ne (Join-Path $providerDir 'RevealWidgetProvider.exe')) { $failures.Add("RevealWidgetProvider.exe ran from $ppPath, not from $providerDir.") }
+          }
+          if ($comObject) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($comObject) }
+          $providerProcs | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
 
           Write-Host "==> Building the harness around AppLauncher.cs"
           $harness = "$env:RUNNER_TEMP\widget-open-harness"
