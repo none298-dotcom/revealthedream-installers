@@ -1075,8 +1075,20 @@ jobs:
           }
           $asset = $candidates[0]
 
+          # THE SHA256 OF THE EXACT BYTES WE UPLOADED. The in-app updater downloads the installer and
+          # refuses to run it unless its hash matches this field, so the manifest can never point at a
+          # binary it does not describe. Computed from $installer, which IS the file gh just uploaded,
+          # so the manifest and the published asset cannot drift. Added 2026-09-13 with the real
+          # in-app updater; a manifest without winSha256 makes the updater offer nothing (by design),
+          # so this line is what turns the updater on for customers.
+          $sha = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "Installer SHA256: $sha"
+
           gh release download latest --repo ${{ github.repository }} --pattern latest.json --output latest.json --clobber
           $manifest = Get-Content latest.json -Raw | ConvertFrom-Json
+          # Add-Member -Force so this works whether or not winSha256 already exists on the object read
+          # back from the release (older manifests do not have it).
+          $manifest | Add-Member -NotePropertyName winSha256 -NotePropertyValue $sha -Force
           $manifest.winUrl = "https://github.com/${{ github.repository }}/releases/download/latest/$($asset.name)"
           $manifest.winSizeBytes = $asset.size
           # winVersion IS THE UPDATE CHECK. DesktopUpdateCheck.kt fetches this manifest and compares
@@ -1114,6 +1126,8 @@ jobs:
             exit 1
           }
           if ($onDisk.winUrl -notlike "*$($asset.name)") { Write-Error "winUrl does not end in the asset name"; exit 1 }
+          if ($onDisk.winSha256 -ne $sha) { Write-Error "Manifest on disk has the wrong winSha256. The write-back did not happen."; exit 1 }
+          if ($onDisk.winSha256 -notmatch '^[0-9a-f]{64}$') { Write-Error "winSha256 is not 64 hex characters: $($onDisk.winSha256)"; exit 1 }
 
           gh release upload latest latest.json --clobber --repo ${{ github.repository }}
 
@@ -1136,4 +1150,8 @@ jobs:
             Write-Error "PUBLISHED winUrl is $($published.winUrl), expected it to end in $($asset.name)."
             exit 1
           }
-          Write-Host "Published manifest verified: winVersion $($published.winVersion), $($published.winUrl)"
+          if ($published.winSha256 -ne $sha) {
+            Write-Error "PUBLISHED winSha256 is $($published.winSha256), expected $sha. The updater would refuse every download."
+            exit 1
+          }
+          Write-Host "Published manifest verified: winVersion $($published.winVersion), winSha256 $($published.winSha256), $($published.winUrl)"
