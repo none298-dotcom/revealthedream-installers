@@ -6,16 +6,28 @@ name: Verify the Windows in-app updater
 # source repo is private and billing blocked, so a workflow committed there never runs. This checks
 # the private source out with a read-only PAT and never leaves source behind.
 #
-# What it does, in one job so the same machine installs, updates and inspects:
-#   1. Builds and signs a LOW version installer and a HIGH version installer from the same source,
-#      by patching packageVersion and APP_VERSION before each build.
-#   2. Installs the LOW one exactly as a customer would (/quiet /norestart, unelevated) and asserts
+# THREE JOBS, AND THE SPLIT IS THE SECURITY PROPERTY (SECURITY-AUDIT-2026-09-14 P-2). A job that runs
+# Gradle executes every build-time dependency it resolves. If that job could also mint an Azure OIDC
+# session, one compromised Maven artifact could sign anything as Little Bird Trading LLC. So:
+#   build   contents: read, no id-token, no Azure. Builds a LOW and a HIGH installer from the same
+#           source (patching packageVersion and APP_VERSION before each) and uploads them unsigned.
+#   sign    id-token: write. Runs no build tooling: downloads the two files, signs them, checks the
+#           signature landed, uploads them.
+#   verify  contents: read, no id-token. Downloads the SIGNED bytes, checks their signatures again,
+#           then everything below. It runs Gradle (`:desktop:run` drives the harness), which is why
+#           it must not be the job that holds the signing session.
+#
+# What verify does, in one job so the same machine installs, updates and inspects:
+#   1. Installs the LOW one exactly as a customer would (/quiet /norestart, unelevated) and asserts
 #      Windows reports the LOW version.
-#   3. Renders the update prompt and progress screens for a human to look at.
-#   4. NEGATIVE: a tampered installer (sha mismatch) and an installer signed by a DIFFERENT
-#      certificate are both refused, nothing is executed, and the installed version stays LOW.
-#   5. POSITIVE: drives the real download -> hash -> Authenticode -> scope -> silent install -> relaunch
-#      pipeline and asserts Windows now reports the HIGH version and the app relaunched.
+#   2. Renders the update prompt and progress screens for a human to look at.
+#   3. NEGATIVES, each refused by ITS OWN check, nothing executed, installed version stays LOW:
+#        tampered bytes (sha), a foreign untrusted signer (Authenticode), a genuine company-signed
+#        installer labelled as a version it is not (version resource, W-1), and our subject and
+#        identity EKU forged under a root that IS trusted on this machine (chain pin, W-2).
+#   4. POSITIVE: drives the real download -> hash -> Authenticode -> version -> scope -> silent
+#      install -> relaunch pipeline and asserts Windows now reports the HIGH version and the app
+#      relaunched.
 #
 # The pipeline is driven through `--verify update-selftest`, which lives in the desktop module's
 # `verify` source set (wired onto `:desktop:run` and nothing else, absent from the shipped EXE, which
@@ -32,15 +44,156 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
-  verify-updater:
+  build:
+    permissions:
+      contents: read
+    env:
+      LOW_VERSION: "1.9.0"
+      HIGH_VERSION: "1.9.1"
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out the PRIVATE source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/revealthedream
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Sets both version strings that must agree (build.gradle.kts and Main.kt), the same pair the
+      # main workflow's "Find the installer" step cross-checks. Done in the workspace, never committed.
+      - name: Set the LOW version
+        shell: pwsh
+        run: |
+          (Get-Content android/desktop/build.gradle.kts) -replace 'packageVersion = "[^"]+"', "packageVersion = `"$env:LOW_VERSION`"" | Set-Content android/desktop/build.gradle.kts
+          (Get-Content android/desktop/src/main/kotlin/com/revealthedream/desktop/Main.kt) -replace 'APP_VERSION = "[^"]+"', "APP_VERSION = `"$env:LOW_VERSION`"" | Set-Content android/desktop/src/main/kotlin/com/revealthedream/desktop/Main.kt
+
+      - name: Build the LOW installer
+        working-directory: android
+        run: ./gradlew :desktop:packageExe --console=plain --no-daemon
+
+      - name: Collect the LOW installer
+        shell: pwsh
+        run: |
+          $exe = @(Get-ChildItem -Recurse -Filter *.exe -Path android/desktop/build/compose/binaries/main/exe)[0]
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\unsigned" | Out-Null
+          Copy-Item $exe.FullName "$env:RUNNER_TEMP\unsigned\low.exe" -Force
+          Write-Host "LOW installer: $($exe.Name)"
+
+      - name: Set the HIGH version and rebuild
+        shell: pwsh
+        run: |
+          (Get-Content android/desktop/build.gradle.kts) -replace 'packageVersion = "[^"]+"', "packageVersion = `"$env:HIGH_VERSION`"" | Set-Content android/desktop/build.gradle.kts
+          (Get-Content android/desktop/src/main/kotlin/com/revealthedream/desktop/Main.kt) -replace 'APP_VERSION = "[^"]+"', "APP_VERSION = `"$env:HIGH_VERSION`"" | Set-Content android/desktop/src/main/kotlin/com/revealthedream/desktop/Main.kt
+          Remove-Item -Recurse -Force android/desktop/build/compose/binaries/main/exe -ErrorAction SilentlyContinue
+
+      - name: Build the HIGH installer
+        working-directory: android
+        run: ./gradlew :desktop:packageExe --console=plain --no-daemon
+
+      - name: Collect the HIGH installer
+        shell: pwsh
+        run: |
+          $exe = @(Get-ChildItem -Recurse -Filter *.exe -Path android/desktop/build/compose/binaries/main/exe)[0]
+          Copy-Item $exe.FullName "$env:RUNNER_TEMP\unsigned\high.exe" -Force
+          Write-Host "HIGH installer: $($exe.Name)"
+
+      - name: Upload the unsigned installers
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: updater-installers-unsigned
+          path: ${{ runner.temp }}/unsigned/*.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    needs: build
+    permissions:
+      contents: read
+      id-token: write
     env:
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    runs-on: windows-2022
+
+    # No checkout, no Java, no Gradle, nothing from the source tree runs here.
+    steps:
+      - name: Download the unsigned installers
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: updater-installers-unsigned
+          path: ${{ runner.temp }}/installers
+
+      - name: Azure login (federated, OIDC)
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign the LOW installer
+        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
+        with:
+          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
+          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: mlcsigning
+          certificate-profile-name: mlc-public-trust
+          files: ${{ runner.temp }}\installers\low.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Sign the HIGH installer
+        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
+        with:
+          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
+          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: mlcsigning
+          certificate-profile-name: mlc-public-trust
+          files: ${{ runner.temp }}\installers\high.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # A signing step that quietly did nothing still reports success, so assert on the files.
+      - name: Assert both signatures landed
+        shell: pwsh
+        run: |
+          foreach ($f in @("$env:RUNNER_TEMP\installers\low.exe", "$env:RUNNER_TEMP\installers\high.exe")) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $f
+            Write-Host "$(Split-Path -Leaf $f): $($sig.Status) by $($sig.SignerCertificate.Subject), timestamp $($sig.TimeStamperCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { Write-Error "$f is $($sig.Status), not Valid"; exit 1 }
+            if (-not $sig.TimeStamperCertificate) { Write-Error "$f is signed but NOT timestamped"; exit 1 }
+            if ($sig.SignerCertificate.Subject -ne 'CN=Little Bird Trading LLC, O=Little Bird Trading LLC, L=Newark, S=Delaware, C=US') { Write-Error "$f signed by an unexpected identity"; exit 1 }
+          }
+
+      - name: Upload the signed installers
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: updater-installers-signed
+          path: ${{ runner.temp }}/installers/*.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  verify:
+    needs: sign
+    permissions:
+      contents: read
+    env:
       LOW_VERSION: "1.9.0"
       HIGH_VERSION: "1.9.1"
+      EXPECTED_SUBJECT: "CN=Little Bird Trading LLC, O=Little Bird Trading LLC, L=Newark, S=Delaware, C=US"
+      IDENTITY_EKU: "1.3.6.1.4.1.311.97.842861343.88466421.655252977.883235864"
     runs-on: windows-2022
 
     steps:
@@ -61,7 +214,11 @@ jobs:
       # installed version out of whichever Uninstall hive holds it (an admin runner performing a
       # per-user install lands the entry in HKLM; see AGENTS.md on not inferring scope from the hive,
       # which is why this only reads DisplayVersion and never judges scope from it).
-      - name: Write the registry helper
+      #
+      # Get-LatestUpdateLog reads the update.log of the most recent self-test run. Every signature
+      # refusal shows the customer the same sentence, so a negative can only prove WHICH check refused
+      # it by reading the reason the controller logged.
+      - name: Write the registry and log helpers
         shell: pwsh
         run: |
           @'
@@ -74,88 +231,52 @@ jobs:
                      Where-Object { $_.DisplayName -like "*Reveal the Dream*" } | Select-Object -First 1
             if ($entry) { return $entry.DisplayVersion } else { return $null }
           }
+          function Get-LatestUpdateLog {
+            $dir = Get-ChildItem "$env:TEMP\rtd-update-selftest-*" -Directory -ErrorAction SilentlyContinue |
+                   Sort-Object Name -Descending | Select-Object -First 1
+            if (-not $dir) { return '' }
+            $log = Join-Path $dir.FullName "update.log"
+            if (Test-Path $log) { return (Get-Content $log -Raw) } else { return '' }
+          }
           '@ | Set-Content "$env:RUNNER_TEMP\updater-registry.ps1" -Encoding utf8
 
-      - name: Azure login (federated, OIDC)
-        if: ${{ env.AZURE_CLIENT_ID != '' }}
-        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+      # The order of truth: these bytes came from the sign job, so check the signature on what was
+      # DOWNLOADED, not on what the sign job said it produced. Also the runner-side measurement of what
+      # the updater's own checks read: the version resource and the rebuilt chain, element by element.
+      - name: Download the signed installers
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          client-id: ${{ env.AZURE_CLIENT_ID }}
-          tenant-id: ${{ env.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          name: updater-installers-signed
+          path: ${{ runner.temp }}/signed
 
-      # Sets both version strings that must agree (build.gradle.kts and Main.kt), the same pair the
-      # main workflow's "Find the installer" step cross-checks. Done in the workspace, never committed.
-      - name: Set the LOW version
+      - name: Check the downloaded signatures, and print what the updater will read
+        id: signed
         shell: pwsh
         run: |
-          (Get-Content android/desktop/build.gradle.kts) -replace 'packageVersion = "[^"]+"', "packageVersion = `"$env:LOW_VERSION`"" | Set-Content android/desktop/build.gradle.kts
-          (Get-Content android/desktop/src/main/kotlin/com/revealthedream/desktop/Main.kt) -replace 'APP_VERSION = "[^"]+"', "APP_VERSION = `"$env:LOW_VERSION`"" | Set-Content android/desktop/src/main/kotlin/com/revealthedream/desktop/Main.kt
+          $low = "$env:RUNNER_TEMP\signed\low.exe"
+          $high = "$env:RUNNER_TEMP\signed\high.exe"
+          foreach ($f in @($low, $high)) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $f
+            $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+            $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+            $chain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::IgnoreNotTimeValid
+            $built = $chain.Build($sig.SignerCertificate)
+            $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($f)
+            Write-Host "$(Split-Path -Leaf $f): $($sig.Status) by $($sig.SignerCertificate.Subject)"
+            Write-Host "  version resource: ProductName='$($vi.ProductName)' FileVersion='$($vi.FileVersion)' ProductVersion='$($vi.ProductVersion)'"
+            Write-Host "  chain Build() = $built"
+            $i = 0
+            foreach ($e in $chain.ChainElements) {
+              Write-Host "  [$i] $($e.Certificate.Thumbprint)  $($e.Certificate.Subject)  status: $(($e.ChainElementStatus | ForEach-Object { $_.Status }) -join ',')"
+              $i++
+            }
+            if ($sig.Status -ne 'Valid') { Write-Error "$f is $($sig.Status) after download"; exit 1 }
+            if ($sig.SignerCertificate.Subject -ne $env:EXPECTED_SUBJECT) { Write-Error "$f signed by an unexpected identity after download"; exit 1 }
+          }
+          "low=$low" >> $env:GITHUB_OUTPUT
+          "high=$high" >> $env:GITHUB_OUTPUT
 
-      - name: Build the LOW installer
-        working-directory: android
-        run: ./gradlew :desktop:packageExe --console=plain --no-daemon
-
-      - name: Collect and sign the LOW installer
-        id: low
-        shell: pwsh
-        run: |
-          $exe = @(Get-ChildItem -Recurse -Filter *.exe -Path android/desktop/build/compose/binaries/main/exe)[0]
-          $dest = "$env:RUNNER_TEMP\low.exe"
-          Copy-Item $exe.FullName $dest -Force
-          "installer=$dest" >> $env:GITHUB_OUTPUT
-          Write-Host "LOW installer: $($exe.Name)"
-
-      - name: Sign the LOW installer
-        if: ${{ env.AZURE_CLIENT_ID != '' }}
-        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
-        with:
-          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
-          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
-          endpoint: https://eus.codesigning.azure.net/
-          trusted-signing-account-name: mlcsigning
-          certificate-profile-name: mlc-public-trust
-          files: ${{ steps.low.outputs.installer }}
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-
-      - name: Set the HIGH version and rebuild
-        shell: pwsh
-        run: |
-          (Get-Content android/desktop/build.gradle.kts) -replace 'packageVersion = "[^"]+"', "packageVersion = `"$env:HIGH_VERSION`"" | Set-Content android/desktop/build.gradle.kts
-          (Get-Content android/desktop/src/main/kotlin/com/revealthedream/desktop/Main.kt) -replace 'APP_VERSION = "[^"]+"', "APP_VERSION = `"$env:HIGH_VERSION`"" | Set-Content android/desktop/src/main/kotlin/com/revealthedream/desktop/Main.kt
-          Remove-Item -Recurse -Force android/desktop/build/compose/binaries/main/exe -ErrorAction SilentlyContinue
-
-      - name: Build the HIGH installer
-        working-directory: android
-        run: ./gradlew :desktop:packageExe --console=plain --no-daemon
-
-      - name: Collect the HIGH installer
-        id: high
-        shell: pwsh
-        run: |
-          $exe = @(Get-ChildItem -Recurse -Filter *.exe -Path android/desktop/build/compose/binaries/main/exe)[0]
-          $dest = "$env:RUNNER_TEMP\high.exe"
-          Copy-Item $exe.FullName $dest -Force
-          "installer=$dest" >> $env:GITHUB_OUTPUT
-          Write-Host "HIGH installer: $($exe.Name)"
-
-      - name: Sign the HIGH installer
-        if: ${{ env.AZURE_CLIENT_ID != '' }}
-        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
-        with:
-          azure-tenant-id: ${{ env.AZURE_TENANT_ID }}
-          azure-client-id: ${{ env.AZURE_CLIENT_ID }}
-          endpoint: https://eus.codesigning.azure.net/
-          trusted-signing-account-name: mlcsigning
-          certificate-profile-name: mlc-public-trust
-          files: ${{ steps.high.outputs.installer }}
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-
-      # The two negative fixtures.
+      # The two older negative fixtures.
       #   tampered.exe : the HIGH bytes with one flipped, so its sha will never match a manifest.
       #   foreign.exe  : the HIGH bytes re-signed by a self-signed certificate this machine does not
       #                  trust and whose subject is not Little Bird Trading LLC. Its sha is computed
@@ -165,7 +286,7 @@ jobs:
         id: fixtures
         shell: pwsh
         run: |
-          $high = "${{ steps.high.outputs.installer }}"
+          $high = "${{ steps.signed.outputs.high }}"
 
           $tampered = "$env:RUNNER_TEMP\tampered.exe"
           Copy-Item $high $tampered -Force
@@ -187,7 +308,7 @@ jobs:
       - name: Install the LOW version
         shell: pwsh
         run: |
-          $p = Start-Process "${{ steps.low.outputs.installer }}" -ArgumentList "/quiet","/norestart" -Wait -PassThru
+          $p = Start-Process "${{ steps.signed.outputs.low }}" -ArgumentList "/quiet","/norestart" -Wait -PassThru
           if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Write-Error "LOW install failed: $($p.ExitCode)"; exit 1 }
 
       - name: Locate the installed app and assert it is the LOW version
@@ -231,8 +352,8 @@ jobs:
         working-directory: android
         shell: pwsh
         run: |
-          $sha = (Get-FileHash "${{ steps.high.outputs.installer }}" -Algorithm SHA256).Hash.ToLowerInvariant()
-          $len = (Get-Item "${{ steps.high.outputs.installer }}").Length
+          $sha = (Get-FileHash "${{ steps.signed.outputs.high }}" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $len = (Get-Item "${{ steps.signed.outputs.high }}").Length
           $manifest = @{ winVersion = $env:HIGH_VERSION; winUrl = "https://dl.revealthedream.com/windows/$env:HIGH_VERSION/RevealTheDream-Windows-Setup.exe"; winSha256 = $sha; winSizeBytes = $len } | ConvertTo-Json
           $manifest | Set-Content "$env:RUNNER_TEMP\m-tampered.json" -Encoding utf8
           $out = & ./gradlew ':desktop:run' '--console=plain' '-q' "--args=--verify update-selftest $env:RUNNER_TEMP\m-tampered.json '${{ steps.installed.outputs.exe }}' '${{ steps.fixtures.outputs.tampered }}' --negative sha" 2>&1 | Out-String
@@ -255,13 +376,105 @@ jobs:
           # The SPECIFIC refusal. Run 34763108409 passed this step with 'Windows could not confirm who signed', a signature check that could not run at all.
           if ($out -notmatch 'refused-as-expected message=The downloaded file is not signed by Little Bird Trading LLC') { Write-Error "refused, but not by the publisher check"; exit 1 }
 
-      - name: Both negatives left the installed version untouched
+      # NEGATIVE 3 (W-1): a GENUINE company-signed Reveal the Dream installer, matched by sha, offered
+      # as a version it is not. This is the "old build labelled 99.0" attack: every signature check
+      # passes, and only the version resource can tell. The LOW installer is served under a manifest
+      # that says HIGH.
+      - name: Negative - a genuine installer offered as the wrong version is refused
+        working-directory: android
+        shell: pwsh
+        run: |
+          . "$env:RUNNER_TEMP\updater-registry.ps1"
+          $sha = (Get-FileHash "${{ steps.signed.outputs.low }}" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $len = (Get-Item "${{ steps.signed.outputs.low }}").Length
+          $manifest = @{ winVersion = $env:HIGH_VERSION; winUrl = "https://dl.revealthedream.com/windows/$env:HIGH_VERSION/RevealTheDream-Windows-Setup.exe"; winSha256 = $sha; winSizeBytes = $len } | ConvertTo-Json
+          $manifest | Set-Content "$env:RUNNER_TEMP\m-relabelled.json" -Encoding utf8
+          $out = & ./gradlew ':desktop:run' '--console=plain' '-q' "--args=--verify update-selftest $env:RUNNER_TEMP\m-relabelled.json '${{ steps.installed.outputs.exe }}' '${{ steps.signed.outputs.low }}' --negative version" 2>&1 | Out-String
+          Write-Host $out
+          if ($out -notmatch 'VERIFY_UPDATE:refused-as-expected') { Write-Error "a relabelled genuine installer was not refused"; exit 1 }
+          if ($out -notmatch 'refused-as-expected message=The downloaded file is not the Reveal the Dream update that was offered') { Write-Error "refused, but not by the version resource check"; exit 1 }
+          $log = Get-LatestUpdateLog
+          Write-Host "--- update.log ---`n$log"
+          if ($log -notmatch 'refused before running anything: version resource says') { Write-Error "the log does not show the VERSION check refusing it"; exit 1 }
+
+      # NEGATIVE 4 (W-2): our exact subject and our identity EKU, on a leaf issued by a root that this
+      # machine TRUSTS. The earlier foreign negative used an UNTRUSTED root, so Authenticode refused it
+      # first and the chain pin was never exercised. Here Get-AuthenticodeSignature must say Valid
+      # (asserted, or this step proves nothing), and only the chain checks can refuse it.
+      #
+      # The rogue root lives in LocalMachine\Root for this one step. The cleanup step right after runs
+      # always(), so a failure here cannot leave it trusted for the positive test below.
+      - name: Negative - our identity forged under a trusted rogue root is refused
+        working-directory: android
+        shell: pwsh
+        run: |
+          . "$env:RUNNER_TEMP\updater-registry.ps1"
+          $root = New-SelfSignedCertificate -Type Custom -Subject "CN=RTD CI Rogue Root (delete me)" `
+                    -KeyUsage CertSign, CRLSign, DigitalSignature -KeyExportPolicy Exportable `
+                    -TextExtension @("2.5.29.19={critical}{text}ca=1&pathlength=1") `
+                    -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(2)
+          "ROGUE_ROOT_THUMBPRINT=$($root.Thumbprint)" >> $env:GITHUB_ENV
+          Export-Certificate -Cert $root -FilePath "$env:RUNNER_TEMP\rogue-root.cer" | Out-Null
+          Import-Certificate -FilePath "$env:RUNNER_TEMP\rogue-root.cer" -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+
+          # The subject must come back EXACTLY as the updater compares it, or the refusal below would
+          # come from the subject check. Windows prints a DN in the reverse of its encoded order, so
+          # the other order is tried if the first does not read back identically.
+          $leaf = $null
+          $rdns = $env:EXPECTED_SUBJECT -split ', '
+          foreach ($subject in @($env:EXPECTED_SUBJECT, (($rdns[($rdns.Length - 1)..0]) -join ', '))) {
+            $candidate = New-SelfSignedCertificate -Type Custom -Subject $subject -Signer $root `
+                           -KeyUsage DigitalSignature -KeyExportPolicy Exportable `
+                           -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3,$env:IDENTITY_EKU", "2.5.29.19={text}ca=0") `
+                           -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(2)
+            "ROGUE_LEAF_THUMBPRINTS=$env:ROGUE_LEAF_THUMBPRINTS $($candidate.Thumbprint)" >> $env:GITHUB_ENV
+            $env:ROGUE_LEAF_THUMBPRINTS = "$env:ROGUE_LEAF_THUMBPRINTS $($candidate.Thumbprint)"
+            Write-Host "leaf asked for '$subject', reads back '$($candidate.Subject)'"
+            if ($candidate.Subject -eq $env:EXPECTED_SUBJECT) { $leaf = $candidate; break }
+          }
+          if (-not $leaf) { Write-Error "could not mint a leaf whose subject reads back as '$env:EXPECTED_SUBJECT'"; exit 1 }
+
+          $rogue = "$env:RUNNER_TEMP\rogue.exe"
+          Copy-Item "${{ steps.signed.outputs.high }}" $rogue -Force
+          Set-AuthenticodeSignature -FilePath $rogue -Certificate $leaf -HashAlgorithm SHA256 | Out-Null
+          $sig = Get-AuthenticodeSignature -LiteralPath $rogue
+          $ekus = @($sig.SignerCertificate.Extensions | Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] } | ForEach-Object { $_.EnhancedKeyUsages } | ForEach-Object { $_.Value })
+          Write-Host "rogue: $($sig.Status) by '$($sig.SignerCertificate.Subject)', EKUs $($ekus -join ', ')"
+          if ($sig.Status -ne 'Valid') { Write-Error "the rogue signature is $($sig.Status), so Windows does not trust the rogue root and this negative would not reach the chain pin"; exit 1 }
+          if ($ekus -notcontains $env:IDENTITY_EKU) { Write-Error "the rogue leaf lacks the identity EKU, so the EKU check would refuse it first"; exit 1 }
+
+          $sha = (Get-FileHash $rogue -Algorithm SHA256).Hash.ToLowerInvariant()
+          $len = (Get-Item $rogue).Length
+          $manifest = @{ winVersion = $env:HIGH_VERSION; winUrl = "https://dl.revealthedream.com/windows/$env:HIGH_VERSION/RevealTheDream-Windows-Setup.exe"; winSha256 = $sha; winSizeBytes = $len } | ConvertTo-Json
+          $manifest | Set-Content "$env:RUNNER_TEMP\m-rogue.json" -Encoding utf8
+          $out = & ./gradlew ':desktop:run' '--console=plain' '-q' "--args=--verify update-selftest $env:RUNNER_TEMP\m-rogue.json '${{ steps.installed.outputs.exe }}' '$rogue' --negative rogue-root" 2>&1 | Out-String
+          Write-Host $out
+          if ($out -notmatch 'VERIFY_UPDATE:refused-as-expected') { Write-Error "an installer forged under a trusted rogue root was not refused"; exit 1 }
+          if ($out -notmatch 'refused-as-expected message=The downloaded file is not signed by Little Bird Trading LLC') { Write-Error "refused, but not by a signature check"; exit 1 }
+          $log = Get-LatestUpdateLog
+          Write-Host "--- update.log ---`n$log"
+          if ($log -notmatch 'refused before running anything: chain ') { Write-Error "the log does not show a CHAIN check refusing it"; exit 1 }
+
+      - name: Remove the rogue root and leaf
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($t in @($env:ROGUE_ROOT_THUMBPRINT) + @("$env:ROGUE_LEAF_THUMBPRINTS" -split '\s+')) {
+            if (-not $t) { continue }
+            foreach ($store in @("Cert:\LocalMachine\Root", "Cert:\CurrentUser\Root", "Cert:\CurrentUser\My", "Cert:\LocalMachine\CA", "Cert:\CurrentUser\CA")) {
+              if (Test-Path "$store\$t") { Remove-Item "$store\$t" -Force; Write-Host "removed $t from $store" }
+            }
+          }
+          if ($env:ROGUE_ROOT_THUMBPRINT -and (Test-Path "Cert:\LocalMachine\Root\$env:ROGUE_ROOT_THUMBPRINT")) { Write-Error "the rogue root is STILL trusted"; exit 1 }
+          Write-Host "No rogue root is trusted on this runner."
+
+      - name: Every negative left the installed version untouched
         shell: pwsh
         run: |
           . "$env:RUNNER_TEMP\updater-registry.ps1"
           $v = Get-RevealDisplayVersion
           if ($v -ne $env:LOW_VERSION) { Write-Error "a refused update changed the installed version to $v"; exit 1 }
-          Write-Host "Still $v after both refusals."
+          Write-Host "Still $v after four refusals."
 
       # POSITIVE: the genuine HIGH installer, matched by sha, signed by us. This runs the real
       # download/verify/scope pipeline and the detached helper, which installs HIGH over LOW and
@@ -270,11 +483,11 @@ jobs:
         working-directory: android
         shell: pwsh
         run: |
-          $sha = (Get-FileHash "${{ steps.high.outputs.installer }}" -Algorithm SHA256).Hash.ToLowerInvariant()
-          $len = (Get-Item "${{ steps.high.outputs.installer }}").Length
+          $sha = (Get-FileHash "${{ steps.signed.outputs.high }}" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $len = (Get-Item "${{ steps.signed.outputs.high }}").Length
           $manifest = @{ winVersion = $env:HIGH_VERSION; winUrl = "https://dl.revealthedream.com/windows/$env:HIGH_VERSION/RevealTheDream-Windows-Setup.exe"; winSha256 = $sha; winSizeBytes = $len } | ConvertTo-Json
           $manifest | Set-Content "$env:RUNNER_TEMP\m-high.json" -Encoding utf8
-          $out = & ./gradlew ':desktop:run' '--console=plain' '-q' "--args=--verify update-selftest $env:RUNNER_TEMP\m-high.json '${{ steps.installed.outputs.exe }}' '${{ steps.high.outputs.installer }}'" 2>&1 | Out-String
+          $out = & ./gradlew ':desktop:run' '--console=plain' '-q' "--args=--verify update-selftest $env:RUNNER_TEMP\m-high.json '${{ steps.installed.outputs.exe }}' '${{ steps.signed.outputs.high }}'" 2>&1 | Out-String
           Write-Host $out
           if ($out -notmatch 'VERIFY_UPDATE:helper-started') { Write-Error "the pipeline did not start the installer"; exit 1 }
 

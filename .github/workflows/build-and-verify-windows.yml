@@ -57,22 +57,32 @@ on:
         type: string
         default: ""
 
+# JOBS, NOT ONE JOB, AND THE SPLIT IS THE SECURITY PROPERTY (SECURITY-AUDIT-2026-09-14 P-2).
+#
+# This used to be one job with `id-token: write` for its whole length and `azure/login` run BEFORE
+# Gradle, msbuild and `dotnet restore`. Every build-time dependency those resolve therefore ran
+# beside a live Azure session that can sign anything as Little Bird Trading LLC, and nothing here
+# verifies Gradle dependencies. So no job that runs build tooling holds `id-token: write`:
+#
+#   build-widget     contents: read. Compiles the Widgets Board provider, packs the MSIX unsigned.
+#   sign-widget      id-token: write. No checkout, no build tooling. Signs the MSIX.
+#   build-installer  contents: read. Stages the signed MSIX, runs Gradle, uploads the installer unsigned.
+#   sign-installer   id-token: write. No checkout, no build tooling. Signs the installer and checks
+#                    the signature landed.
+#   verify           No id-token. Downloads the SIGNED bytes, checks the signature on what it
+#                    downloaded, then every install and launch gate, then publishes when asked.
+#                    It keeps `contents: write` because publishing is still its last step, gated
+#                    exactly as before.
 permissions:
-  contents: write     # create/update the Release on this public repo
-  id-token: write     # OIDC token for Azure Trusted Signing, so no cert is stored here
+  contents: read
 
 jobs:
-  build-and-verify:
-    # `secrets` is not a valid context in a step-level `if:` (GitHub rejects the whole workflow
-    # with "Unrecognized named-value: 'secrets'"). Surfacing them as job env vars is the supported
-    # way for a step to ask "is signing configured here?", which keeps the build working in a
-    # fork with no Azure access.
-    env:
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  build-widget:
+    permissions:
+      contents: read
     # PINNED, not windows-latest. windows-latest moved to Server 2025, where a byte identical
     # installer passed 1 run in 6 against 3 of 3 on Server 2022 on the sibling project. Only move
-    # this deliberately, and compare over at least six runs.
+    # this deliberately, and compare over at least six runs. Every job below is pinned the same way.
     runs-on: windows-2022
 
     steps:
@@ -88,11 +98,6 @@ jobs:
           # they invoke. Nothing after this step uses git, so the token has no reason to outlive
           # the checkout. Set false 2026-08-10 after a security audit.
           persist-credentials: false
-
-      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
-        with:
-          distribution: temurin
-          java-version: "17"
 
       # The Widgets Board provider. COMPILING IT IS THE ONLY THING THIS RUNNER CAN PROVE.
       #
@@ -169,26 +174,6 @@ jobs:
           if ($missing.Count) { Write-Error "Missing package assets: $($missing -join ', ')"; exit 1 }
           Write-Host "All referenced assets present"
 
-      # LOGS IN ONCE, BEFORE THE FIRST SIGNING STEP. Two things get signed now, the widget package
-      # and the installer, and this used to sit between them: the widget signing failed with a
-      # credential error while the installer signed fine, which reads like a problem with the
-      # package rather than with the ordering.
-      #
-      # trusted-signing-action authenticates via DefaultAzureCredential, which knows nothing about
-      # GitHub OIDC on its own. Without azure/login first it falls through every credential in the
-      # chain (CLI, Developer CLI, Visual Studio) and dies with "SignerSign() failed". azure/login
-      # performs the federated exchange and leaves the runner in a state the action can use.
-      #
-      # Nothing secret lives in this public repo: the three AZURE_* values are identifiers, and
-      # the certificates are short lived, minted by Azure per run.
-      - name: Azure login (federated, OIDC)
-        if: ${{ env.AZURE_CLIENT_ID != '' }}
-        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
-        with:
-          client-id: ${{ env.AZURE_CLIENT_ID }}
-          tenant-id: ${{ env.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
       # PACK THE SPARSE PACKAGE. Only the manifest and the icons go inside; the provider
       # executable stays outside and is found via -ExternalLocation at registration time. That is
       # what keeps the 55 MB jpackage bundle out of MSIX entirely.
@@ -211,6 +196,68 @@ jobs:
           "msix=$out" >> $env:GITHUB_OUTPUT
           Write-Host "Packed $([math]::Round((Get-Item $out).Length/1KB,1)) KB"
 
+      - name: Upload the unsigned widget MSIX
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: widget-msix-unsigned
+          path: ${{ steps.msix.outputs.msix }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload the widget provider
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: widget-provider
+          path: windows/WidgetProvider/bin/x64/Release/net8.0-windows10.0.22621.0/win-x64/publish/
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-widget:
+    needs: build-widget
+    permissions:
+      contents: read
+      id-token: write
+    # `secrets` is not a valid context in a step-level `if:` (GitHub rejects the whole workflow
+    # with "Unrecognized named-value: 'secrets'"). Surfacing them as job env vars is the supported
+    # way for a step to ask "is signing configured here?", which keeps the build working in a
+    # fork with no Azure access.
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    runs-on: windows-2022
+
+    # No checkout and no build tooling: the only code that runs beside the Azure session is the two
+    # pinned Azure actions and this workflow's own PowerShell.
+    steps:
+      - name: Download the unsigned widget MSIX
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: widget-msix-unsigned
+          path: ${{ runner.temp }}/msix
+
+      - name: Locate the MSIX
+        id: msix
+        shell: pwsh
+        run: |
+          $found = @(Get-ChildItem "$env:RUNNER_TEMP\msix" -Filter *.msix)
+          if ($found.Count -ne 1) { Write-Error "Expected one MSIX, found $($found.Count)"; exit 1 }
+          "msix=$($found[0].FullName)" >> $env:GITHUB_OUTPUT
+
+      # trusted-signing-action authenticates via DefaultAzureCredential, which knows nothing about
+      # GitHub OIDC on its own. Without azure/login first it falls through every credential in the
+      # chain (CLI, Developer CLI, Visual Studio) and dies with "SignerSign() failed". azure/login
+      # performs the federated exchange and leaves the runner in a state the action can use.
+      #
+      # Nothing secret lives in this public repo: the three AZURE_* values are identifiers, and
+      # the certificates are short lived, minted by Azure per run.
+      - name: Azure login (federated, OIDC)
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
       # An UNSIGNED sparse package cannot be registered at all: Add-AppxPackage refuses it unless
       # the machine is in developer mode. Signing it with the same Trusted Signing identity as the
       # installer is what makes registration work on an ordinary customer machine.
@@ -228,6 +275,46 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
+      - name: Upload the signed widget MSIX
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: widget-msix-signed
+          path: ${{ steps.msix.outputs.msix }}
+          if-no-files-found: error
+          retention-days: 1
+
+  build-installer:
+    needs: sign-widget
+    permissions:
+      contents: read
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out the PRIVATE source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/revealthedream
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download the signed widget MSIX
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: widget-msix-signed
+          path: ${{ runner.temp }}/widget-msix
+
+      - name: Download the widget provider
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: widget-provider
+          path: ${{ runner.temp }}/widget-provider
+
       # Staged BEFORE the installer is built. appResourcesRootDir copies resources/windows/ into the
       # installed application directory, so the package ships inside the installer and the app can
       # register it on first launch without a separate download.
@@ -236,10 +323,13 @@ jobs:
         run: |
           $res = "android/desktop/resources/windows"
           New-Item -ItemType Directory -Force -Path $res | Out-Null
-          Copy-Item "${{ steps.msix.outputs.msix }}" "$res/RevealTheDreamWidgets.msix"
+          $msix = @(Get-ChildItem "$env:RUNNER_TEMP\widget-msix" -Filter *.msix)
+          if ($msix.Count -ne 1) { Write-Error "Expected one signed MSIX, found $($msix.Count)"; exit 1 }
+          Copy-Item $msix[0].FullName "$res/RevealTheDreamWidgets.msix"
           # The provider executable and its self-contained runtime live NEXT TO the app, which is
           # exactly what the package's external location points at.
-          Copy-Item "windows/WidgetProvider/bin/x64/Release/net8.0-windows10.0.22621.0/win-x64/publish/*" $res -Recurse -Force
+          if (-not (Test-Path "$env:RUNNER_TEMP\widget-provider\RevealWidgetProvider.exe")) { Write-Error "The downloaded provider has no RevealWidgetProvider.exe"; exit 1 }
+          Copy-Item "$env:RUNNER_TEMP\widget-provider\*" $res -Recurse -Force
           Write-Host "Staged $((Get-ChildItem $res -Recurse -File).Count) files"
 
       # No Android SDK is installed here and none is needed: :desktop is plain Kotlin/JVM.
@@ -254,34 +344,6 @@ jobs:
         if: ${{ inputs.package_url == '' }}
         working-directory: android
         run: ./gradlew :desktop:packageExe --console=plain --no-daemon
-
-      # The submitted artifact, fetched and pinned by hash so the log records exactly which bytes
-      # every assertion below is about.
-      - name: Download the installer under test
-        id: fetch
-        if: ${{ inputs.package_url != '' }}
-        shell: pwsh
-        run: |
-          $url = "${{ inputs.package_url }}"
-          $out = Join-Path $env:RUNNER_TEMP "package-under-test.exe"
-          Write-Host "Fetching $url"
-          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
-          $item = Get-Item $out
-          $hash = (Get-FileHash $out -Algorithm SHA256).Hash
-          Write-Host "Bytes : $($item.Length)"
-          Write-Host "SHA256: $hash"
-
-          # A redirect or an error page saved as .exe would otherwise sail through and fail later
-          # as something confusing. MZ is the DOS header every Windows executable starts with.
-          $head = [System.IO.File]::ReadAllBytes($out)[0..1]
-          if ($head[0] -ne 0x4D -or $head[1] -ne 0x5A) {
-            Write-Error "That URL did not return a Windows executable. First bytes were $($head -join ',')."
-            exit 1
-          }
-          "installer=$out" >> $env:GITHUB_OUTPUT
-          "name=$($item.Name)" >> $env:GITHUB_OUTPUT
-          "sha256=$hash" >> $env:GITHUB_OUTPUT
-          "## Package under test`n`n``$url```n`nSHA256 ``$hash```n`n$($item.Length) bytes" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
       - name: Find the installer
         id: find
@@ -329,26 +391,60 @@ jobs:
           }
           "version=$gradleVersion" >> $env:GITHUB_OUTPUT
 
+      - name: Upload the unsigned installer
+        if: ${{ inputs.package_url == '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: installer-unsigned
+          path: ${{ steps.find.outputs.installer }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # Not run when verifying a downloaded package: re-signing would rewrite the exact bytes the run
+  # exists to check, and the artifact at a submission URL is already signed.
+  sign-installer:
+    needs: build-installer
+    if: ${{ inputs.package_url == '' }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    runs-on: windows-2022
+
+    # No checkout and no build tooling, as in sign-widget. In a fork with no Azure access the file
+    # passes through unsigned under the same artifact name, as the single job used to let it.
+    steps:
+      - name: Download the unsigned installer
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: installer-unsigned
+          path: ${{ runner.temp }}/installer
+
+      - name: Resolve the installer under test
+        id: installed_pkg
+        shell: pwsh
+        run: |
+          $found = @(Get-ChildItem "$env:RUNNER_TEMP\installer" -Filter *.exe)
+          if ($found.Count -ne 1) { Write-Error "Expected one installer, found $($found.Count)"; exit 1 }
+          Write-Host "Installer to sign: $($found[0].FullName)"
+          "installer=$($found[0].FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Azure login (federated, OIDC)
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+
       # SIGN BEFORE INSTALLING, so everything below verifies the artifact a customer will run,
       # not an unsigned near-copy of it. Auth was established by the login step further up.
       # Signs as Little Bird Trading LLC, the identity validation behind this account. The
       # installer's own Manufacturer field is set to match in android/desktop/build.gradle.kts;
       # if the signing identity ever changes, change that too or Windows shows two companies.
-      # Every step below refers to this, so the built path and the downloaded path converge here
-      # rather than each later step repeating the same conditional and one of them getting it wrong.
-      - name: Resolve the installer under test
-        id: installed_pkg
-        shell: pwsh
-        run: |
-          $built = "${{ steps.find.outputs.installer }}"
-          $fetched = "${{ steps.fetch.outputs.installer }}"
-          $exe = if ($fetched) { $fetched } else { $built }
-          if (-not $exe) { Write-Error "No installer: nothing was built and nothing was downloaded."; exit 1 }
-          Write-Host "Installer under test: $exe"
-          "installer=$exe" >> $env:GITHUB_OUTPUT
-
-      # NOT run when verifying a downloaded package: re-signing would rewrite the exact bytes the
-      # run exists to check, and the artifact at a submission URL is already signed.
       - name: Sign the installer (Azure Trusted Signing)
         if: ${{ inputs.package_url == '' && env.AZURE_CLIENT_ID != '' }}
         uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0
@@ -381,6 +477,218 @@ jobs:
           if ($sig.SignerCertificate.Subject -notmatch 'Little Bird Trading') {
             Write-Error "Signed by an unexpected identity: $($sig.SignerCertificate.Subject)"; exit 1
           }
+
+      - name: Upload the signed installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: installer-signed
+          path: ${{ steps.installed_pkg.outputs.installer }}
+          if-no-files-found: error
+          retention-days: 1
+
+  verify:
+    needs: [build-installer, sign-installer]
+    # sign-installer is SKIPPED, not failed, when package_url is given, and verify must still run.
+    if: ${{ !cancelled() && needs.build-installer.result == 'success' && (needs.sign-installer.result == 'success' || needs.sign-installer.result == 'skipped') }}
+    permissions:
+      contents: write     # the publish step at the end; there is no id-token here
+    # AZURE_CLIENT_ID is read only to ask "was this build meant to be signed". Without id-token:
+    # write it can be exchanged for nothing.
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out the PRIVATE source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/revealthedream
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # THE ORDER OF TRUTH: everything below judges the bytes this job DOWNLOADED from the sign job,
+      # starting with their signature, never what an earlier job said it produced.
+      - name: Download the signed installer
+        if: ${{ inputs.package_url == '' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: installer-signed
+          path: ${{ runner.temp }}/signed-installer
+
+
+      # The submitted artifact, fetched and pinned by hash so the log records exactly which bytes
+      # every assertion below is about.
+      - name: Download the installer under test
+        id: fetch
+        if: ${{ inputs.package_url != '' }}
+        shell: pwsh
+        run: |
+          $url = "${{ inputs.package_url }}"
+          $out = Join-Path $env:RUNNER_TEMP "package-under-test.exe"
+          Write-Host "Fetching $url"
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+          $item = Get-Item $out
+          $hash = (Get-FileHash $out -Algorithm SHA256).Hash
+          Write-Host "Bytes : $($item.Length)"
+          Write-Host "SHA256: $hash"
+
+          # A redirect or an error page saved as .exe would otherwise sail through and fail later
+          # as something confusing. MZ is the DOS header every Windows executable starts with.
+          $head = [System.IO.File]::ReadAllBytes($out)[0..1]
+          if ($head[0] -ne 0x4D -or $head[1] -ne 0x5A) {
+            Write-Error "That URL did not return a Windows executable. First bytes were $($head -join ',')."
+            exit 1
+          }
+          "installer=$out" >> $env:GITHUB_OUTPUT
+          "name=$($item.Name)" >> $env:GITHUB_OUTPUT
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          "## Package under test`n`n``$url```n`nSHA256 ``$hash```n`n$($item.Length) bytes" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Find the installer, again, on the downloaded bytes
+        id: find
+        if: ${{ inputs.package_url == '' }}
+        shell: pwsh
+        working-directory: android
+        run: |
+          # Scoped to the exe/ output directory ON PURPOSE. A bare recursive *.exe search also
+          # matches the app image jpackage stages under app/, which contains a "Reveal the
+          # Dream.exe" that is the APPLICATION, not the installer. Picking that one would install
+          # nothing and still look like it worked.
+          $found = @(Get-ChildItem -Recurse -Filter *.exe -Path "$env:RUNNER_TEMP\signed-installer" -ErrorAction SilentlyContinue)
+          if ($found.Count -ne 1) {
+            Write-Error "Expected exactly one installer, found $($found.Count)"
+            $found | ForEach-Object { Write-Host "  $($_.FullName)" }
+            exit 1
+          }
+          $exe = $found[0]
+          "installer=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+          "name=$($exe.Name)" >> $env:GITHUB_OUTPUT
+          Write-Host "Installer: $($exe.Name)  $([math]::Round($exe.Length/1MB,1)) MB"
+
+          # THE VERSION, from three places that must agree, because the manifest's `winVersion` is
+          # what every installed copy compares itself against. Get it wrong and the update check is
+          # silently dead: customers are simply never told a new build exists, and nothing anywhere
+          # reports a problem. That is not hypothetical, it is what this repo did until 2026-08-04,
+          # when the publish step wrote winUrl and winSizeBytes and left winVersion untouched.
+          #
+          #   1. build.gradle.kts packageVersion  -- what jpackage was told to build
+          #   2. the installer's own file name    -- what jpackage actually produced
+          #   3. Main.kt APP_VERSION              -- what the running app compares with
+          #
+          # Three sources rather than one because each catches a different mistake: a bump that
+          # missed a file, a stale build directory serving an older exe, and the app-versus-package
+          # drift the comment on APP_VERSION already warns about.
+          $gradleVersion = (Select-String -Path desktop/build.gradle.kts -Pattern 'packageVersion\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $appVersion = (Select-String -Path desktop/src/main/kotlin/com/revealthedream/desktop/Main.kt -Pattern 'APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($exe.Name -notmatch '(\d+\.\d+\.\d+)') { Write-Error "Cannot read a version out of '$($exe.Name)'"; exit 1 }
+          $fileVersion = $Matches[1]
+
+          Write-Host "Version: gradle=$gradleVersion  file=$fileVersion  app=$appVersion"
+          if ($gradleVersion -ne $fileVersion -or $gradleVersion -ne $appVersion) {
+            Write-Error "Version disagreement. build.gradle.kts=$gradleVersion, installer=$fileVersion, Main.kt APP_VERSION=$appVersion. All three must match or the update check lies to customers."
+            exit 1
+          }
+          "version=$gradleVersion" >> $env:GITHUB_OUTPUT
+
+      # Every step below refers to this, so the built path and the downloaded path converge here
+      # rather than each later step repeating the same conditional and one of them getting it wrong.
+      - name: Resolve the installer under test
+        id: installed_pkg
+        shell: pwsh
+        run: |
+          $built = "${{ steps.find.outputs.installer }}"
+          $fetched = "${{ steps.fetch.outputs.installer }}"
+          $exe = if ($fetched) { $fetched } else { $built }
+          if (-not $exe) { Write-Error "No installer: nothing was built and nothing was downloaded."; exit 1 }
+          Write-Host "Installer under test: $exe"
+          "installer=$exe" >> $env:GITHUB_OUTPUT
+
+      # A signing step that quietly did nothing still reports success, so assert on the file.
+      # Countersigner matters as much as signer: without a timestamp the signature dies the day
+      # the certificate expires, and Trusted Signing certificates are short lived by design.
+      - name: Assert the signature actually landed
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature "${{ steps.installed_pkg.outputs.installer }}"
+          Write-Host "Status:        $($sig.Status)"
+          Write-Host "Signer:        $($sig.SignerCertificate.Subject)"
+          Write-Host "Timestamp:     $($sig.TimeStamperCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { Write-Error "Signature is $($sig.Status), not Valid"; exit 1 }
+          if (-not $sig.TimeStamperCertificate) { Write-Error "Signed but NOT timestamped"; exit 1 }
+          if ($sig.SignerCertificate.Subject -notmatch 'Little Bird Trading') {
+            Write-Error "Signed by an unexpected identity: $($sig.SignerCertificate.Subject)"; exit 1
+          }
+
+      # THE SHIPPED UPDATER'S OWN CHAIN AND VERSION CHECKS, ON THE BYTES ABOUT TO BE PUBLISHED.
+      #
+      # InstallerSignature.kt pins the Microsoft intermediate a genuine installer chains through
+      # (SECURITY-AUDIT-2026-09-14 W-2) and requires the version resource to name this product at the
+      # manifest's version (W-1). Trusted Signing ROTATES the intermediate: 1.7.1 and 1.7.2 came
+      # through different ones eleven hours apart. A release signed through one the app does not pin
+      # would be refused by every installed copy, with no retry, and nothing else here would notice,
+      # because Windows itself calls it Valid. So the pin set is read out of the source and applied
+      # here, and a build the updater would refuse is never published.
+      #
+      # If this fails on a genuine signature: measure the new intermediate, add it to
+      # TRUSTED_INTERMEDIATE_THUMBPRINTS in the same change, and rebuild. Installed copies from
+      # before that change will still refuse it, so re-signing (a new certificate may come from a
+      # pinned CA) is the other way out.
+      - name: Assert the in-app updater will accept this installer
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        shell: pwsh
+        run: |
+          $installer = "${{ steps.installed_pkg.outputs.installer }}"
+          $kt = Get-Content "android/desktop/src/main/kotlin/com/revealthedream/desktop/update/InstallerSignature.kt" -Raw
+          if ($kt -notmatch '(?s)TRUSTED_INTERMEDIATE_THUMBPRINTS[^=]*=\s*setOf\((.*?)\r?\n\s*\)') { Write-Error "Could not read TRUSTED_INTERMEDIATE_THUMBPRINTS from InstallerSignature.kt. This gate must never assume a pin set."; exit 1 }
+          $pins = @([regex]::Matches($Matches[1], '"([0-9A-F]{40})"') | ForEach-Object { $_.Groups[1].Value })
+          if ($pins.Count -lt 1) { Write-Error "TRUSTED_INTERMEDIATE_THUMBPRINTS parsed as empty"; exit 1 }
+          if ($kt -notmatch 'EXPECTED_PRODUCT_NAME\s*=\s*"([^"]+)"') { Write-Error "Could not read EXPECTED_PRODUCT_NAME from InstallerSignature.kt"; exit 1 }
+          $expectedProduct = $Matches[1]
+          Write-Host "Pinned intermediates ($($pins.Count)): $($pins -join ', ')"
+
+          $sig = Get-AuthenticodeSignature -LiteralPath $installer
+          $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+          $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+          $chain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::IgnoreNotTimeValid
+          $built = $chain.Build($sig.SignerCertificate)
+          Write-Host "Chain Build(): $built"
+          $i = 0
+          $bad = @()
+          foreach ($e in $chain.ChainElements) {
+            $flags = @($e.ChainElementStatus | ForEach-Object { "$($_.Status)" })
+            Write-Host "  [$i] $($e.Certificate.Thumbprint)  $($e.Certificate.Subject)  status: $($flags -join ',')"
+            $bad += @($flags | Where-Object { $_ -ne 'NotTimeValid' -and $_ -ne 'NoError' } | ForEach-Object { "[$i] $_" })
+            $i++
+          }
+          if (-not $built) { Write-Error "The chain does not build. The updater refuses this."; exit 1 }
+          if ($bad.Count) { Write-Error "Chain element status the updater refuses: $($bad -join ', ')"; exit 1 }
+          if ($chain.ChainElements.Count -lt 3) { Write-Error "Chain has $($chain.ChainElements.Count) elements; the updater needs leaf, intermediate, root."; exit 1 }
+          $intermediate = $chain.ChainElements[1].Certificate
+          if ($pins -notcontains $intermediate.Thumbprint) {
+            Write-Error "Signed through '$($intermediate.Subject)' ($($intermediate.Thumbprint)), which InstallerSignature.TRUSTED_INTERMEDIATE_THUMBPRINTS does not pin. Every installed copy would refuse this update. See the comment above this step."
+            exit 1
+          }
+
+          $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($installer)
+          Write-Host "Version resource: ProductName='$($vi.ProductName)' FileVersion='$($vi.FileVersion)' ProductVersion='$($vi.ProductVersion)'"
+          if ($vi.ProductName -ne $expectedProduct) { Write-Error "ProductName is '$($vi.ProductName)', the updater requires '$expectedProduct'"; exit 1 }
+          $version = "${{ steps.find.outputs.version }}"
+          if ($version) {
+            $norm = { param($v) $t = "$v".Trim(); if ($t -match '^\d+\.\d+\.\d+\.0$') { $t.Substring(0, $t.Length - 2) } else { $t } }
+            if ((& $norm $vi.FileVersion) -ne $version -and (& $norm $vi.ProductVersion) -ne $version) {
+              Write-Error "The version resource says $($vi.FileVersion)/$($vi.ProductVersion) and the manifest will say $version. The updater refuses that."
+              exit 1
+            }
+          }
+          Write-Host "The in-app updater's chain and version checks accept this installer."
+
 
       # jpackage's exe is a WiX Burn bootstrapper wrapping the same MSI, so it is driven directly
       # rather than through msiexec, and its silent switch is /quiet. Getting this wrong does not
@@ -1032,7 +1340,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: RevealTheDream-Windows-installer
-          path: android/desktop/build/compose/binaries/main/exe/*.exe
+          path: ${{ steps.installed_pkg.outputs.installer }}
           if-no-files-found: error
 
       # Opt in, never automatic. A workflow that publishes to the public as a side effect of being
