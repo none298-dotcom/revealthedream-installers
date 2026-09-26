@@ -176,8 +176,8 @@ jobs:
           }
           Write-Host "===== Does StoreValue appear ANYWHERE under this user's registry? (no Permanent=yes, no custom Component authored) ====="
           $matches = & reg.exe query 'HKCU' /s /f 'StoreValue' 2>&1
-          $lastExit = $LASTEXITCODE
-          if ($lastExit -eq 0) { Write-Host $matches } else { Write-Host "reg.exe found no match for StoreValue anywhere under HKCU (expected: no Registry table exists in this bundle)" }
+          if ($LASTEXITCODE -eq 0) { Write-Host $matches } else { Write-Host "reg.exe found no match for StoreValue anywhere under HKCU (expected: no Registry table exists in this bundle)" }
+          $global:LASTEXITCODE = 0
 
       - name: Uninstall before the ARPCOMMENTS trial
         shell: pwsh
