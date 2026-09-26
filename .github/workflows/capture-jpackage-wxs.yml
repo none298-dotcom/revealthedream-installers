@@ -1,0 +1,110 @@
+name: Capture jpackage's own main.wxs template (throwaway diagnostic)
+
+# ONE-OFF, NOT PART OF ANY RELEASE PATH. Building `android/desktop/resources/windows/main.wxs`
+# (the override that lets InstallOrigin write STOREORIGIN into the registry, see BUGS.md 32) has to
+# "start from jpackage's own generated template for this exact jpackage version; change nothing
+# else" (AGENTS.md's whole point about hand-authored WiX diverging from what jpackage actually
+# emits). jpackage does not expose a "just show me the template" command, and the Compose Gradle
+# plugin does not forward `--temp` (it always lets jpackage manage and delete its own scratch
+# directory), so the only way to see the real bytes is to run the exact same build once with
+# `--debug` to recover the literal jpackage argument list, then invoke jpackage.exe a second time
+# with those same arguments plus `--temp`, which jpackage does NOT delete when given explicitly.
+#
+# Uploads main.wxs (and anything else jpackage wrote beside it) as a build artifact. Downloaded by
+# hand, edited by hand, committed to the private repo by hand. Delete this workflow once that main.wxs
+# is in place and proven by verify-windows-store-rating.yml; it has no reason to run again unless the
+# JDK/jpackage version pinned by actions/setup-java below changes.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Private repo branch, tag or SHA to build"
+        default: "main"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: windows-2022
+    steps:
+      - name: Check out the PRIVATE source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/revealthedream
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Build the app image and installer with --debug, keeping the log
+        shell: pwsh
+        run: |
+          cd android
+          ./gradlew.bat :desktop:packageExe :desktop:createDistributable --console=plain --debug *> ..\build-debug.log
+          Write-Host "Gradle build finished (or failed); log follows regardless"
+
+      - name: Pull the jpackage argument list out of the debug log
+        shell: pwsh
+        run: |
+          $log = Get-Content -LiteralPath build-debug.log
+          $hits = $log | Select-String -Pattern 'win-upgrade-uuid|jpackage' -SimpleMatch:$false
+          $hits | Select-Object -Last 200 | Out-File -FilePath jpackage-log-excerpt.txt -Encoding utf8
+          Write-Host "----- excerpt (last 200 matching lines) -----"
+          Get-Content jpackage-log-excerpt.txt
+
+      - name: Locate the real app image jpackage already produced
+        shell: pwsh
+        run: |
+          $img = Get-ChildItem -Path "android\desktop\build\compose\binaries\main\app" -Directory | Select-Object -First 1
+          Write-Host "APP_IMAGE=$($img.FullName)"
+          "APP_IMAGE=$($img.FullName)" | Out-File -FilePath app-image-path.txt -Encoding utf8
+
+      - name: Re-run jpackage with --temp so it keeps the WiX sources
+        shell: pwsh
+        run: |
+          $appImage = (Get-Content app-image-path.txt) -replace '^APP_IMAGE=',''
+          $env:PATH = "$env:PATH;$env:WIX\bin"
+          $jpackage = Join-Path $env:JAVA_HOME "bin\jpackage.exe"
+          $temp = "jpackage-capture-temp"
+          $dest = "jpackage-capture-dest"
+          New-Item -ItemType Directory -Force -Path $temp, $dest | Out-Null
+          & $jpackage `
+            --type exe `
+            --app-image $appImage `
+            --name "Reveal the Dream" `
+            --app-version "1.7.4" `
+            --vendor "Little Bird Trading LLC" `
+            --description "Uncover a photo of your goal, one daily check-in at a time." `
+            --copyright "2026 Augustus Travels LLC" `
+            --icon "android\desktop\icons\reveal-the-dream.ico" `
+            --win-upgrade-uuid "8f3d1c72-5b64-4a0e-9e2c-6a1f7d4b83c5" `
+            --win-menu `
+            --win-menu-group "Reveal the Dream" `
+            --win-per-user-install `
+            --win-dir-chooser `
+            --win-shortcut `
+            --temp $temp `
+            --dest $dest `
+            --verbose
+          Write-Host "jpackage exit code: $LASTEXITCODE"
+          Write-Host "----- temp tree -----"
+          Get-ChildItem -Recurse $temp | Select-Object FullName
+
+      - name: Upload everything (log excerpt, temp tree, dest)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: jpackage-wxs-capture
+          path: |
+            jpackage-log-excerpt.txt
+            build-debug.log
+            jpackage-capture-temp/**
+            jpackage-capture-dest/**
+          retention-days: 14
