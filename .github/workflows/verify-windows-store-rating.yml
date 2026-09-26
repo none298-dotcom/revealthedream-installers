@@ -1,0 +1,212 @@
+name: Verify the Windows Store rating prompt (BUGS.md 32)
+
+# LIVES HERE FOR THE SAME REASON EVERY OTHER WORKFLOW IN THIS REPO DOES: the source repo is
+# private and billing blocked, so a workflow committed there is refused before the runner starts.
+# Source never lands here, only the finished installer and the verification's own findings.
+#
+# This is a NEW, separate workflow, not an edit to build-and-verify-windows.yml or either widget
+# workflow -- other work is in flight on those. It reads
+# tools/windows-store-install-parameters.txt (which now carries `STOREORIGIN=store`, see that
+# file's README) and android/desktop/resources/windows/main.wxs (the one added registry
+# component), both owned by this change.
+#
+# THREE THINGS THIS PROVES, MATCHING BUGS.md 32's THREE SURFACES:
+#   1. A Store install (STOREORIGIN=store on the command line) writes
+#      HKCU\Software\Little Bird Trading LLC\Reveal the Dream\InstallOrigin = store.
+#   2. The app's own silent updater path (/quiet /norestart, no STOREORIGIN -- see
+#      UpdateInstaller.SILENT_ARGUMENTS) does NOT erase that value on a major upgrade. The wxs
+#      component is Permanent="yes" for exactly this.
+#   3. A direct-download install (/quiet /norestart, no STOREORIGIN, ever) writes no key at all,
+#      run on a clean machine state so an earlier job's Permanent component cannot leak into it.
+#
+# Also asserts the tray popup still uses the Windows look and feel (`--verify render-screens`
+# prints `VERIFY_TRAY_LOOK_AND_FEEL:`, which must never contain "metal" -- see Verify.kt and
+# TrayPresence). Unrelated to the rating prompt itself, but it is this task's other CI obligation
+# and belongs beside the rest of this module's Windows-only assertions.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Private repo branch, tag or SHA to build"
+        default: "main"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  REG_KEY: 'HKCU:\Software\Little Bird Trading LLC\Reveal the Dream'
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Check out the PRIVATE source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/revealthedream
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # No Android SDK needed -- :desktop is plain Kotlin/JVM. Same note as build-and-verify-windows.yml.
+      - name: Build the installer
+        working-directory: android
+        run: ./gradlew :desktop:packageExe --console=plain --no-daemon
+
+      - name: Find the installer
+        id: find
+        shell: pwsh
+        working-directory: android
+        run: |
+          $found = @(Get-ChildItem -Recurse -Filter *.exe -Path desktop/build/compose/binaries/main/exe -ErrorAction SilentlyContinue)
+          if ($found.Count -ne 1) {
+            Write-Error "Expected exactly one installer, found $($found.Count)"
+            exit 1
+          }
+          Copy-Item $found[0].FullName "$env:RUNNER_TEMP\installer.exe"
+          Write-Host "Installer: $($found[0].Name)  $([math]::Round($found[0].Length/1MB,1)) MB"
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rating-prompt-installer
+          path: ${{ runner.temp }}\installer.exe
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Read the declared parameters
+        id: params
+        shell: pwsh
+        working-directory: android
+        run: |
+          $declared = (Get-Content "../tools/windows-store-install-parameters.txt" -Raw).Trim()
+          if ($declared -notmatch 'STOREORIGIN=store') {
+            Write-Error "tools/windows-store-install-parameters.txt must declare STOREORIGIN=store for the Store submission. Found: $declared"
+            exit 1
+          }
+          Write-Host "Declared Store install parameters: $declared"
+
+  store-install-then-update:
+    needs: build
+    runs-on: windows-2022
+    steps:
+      - name: Download the installer
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rating-prompt-installer
+          path: ${{ runner.temp }}
+
+      - name: Install as the Store would (STOREORIGIN=store)
+        shell: pwsh
+        run: |
+          $exe = "${{ runner.temp }}\installer.exe"
+          $p = Start-Process $exe -ArgumentList "/quiet","/norestart","STOREORIGIN=store" -Wait -PassThru
+          Write-Host "Store install exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Write-Error "Install failed with $($p.ExitCode)"; exit 1 }
+
+      - name: Read the marker right after the Store install
+        shell: pwsh
+        run: |
+          Start-Sleep -Seconds 3
+          $value = $null
+          try { $value = Get-ItemPropertyValue -LiteralPath $env:REG_KEY -Name InstallOrigin } catch { }
+          Write-Host "InstallOrigin after Store install: '$value'"
+          if ($value -ne "store") { Write-Error "Expected InstallOrigin=store right after a Store install, got '$value'"; exit 1 }
+
+      # THE APP'S OWN UPDATER, not a hand-built command line. Reads
+      # tools/windows-store-install-parameters.txt indirectly through UpdateInstaller.SILENT_ARGUMENTS,
+      # which that file's test pins to `/quiet /norestart` with STOREORIGIN stripped -- see
+      # DesktopUpdaterTest. Reinstalling the SAME exe over itself exercises the real major-upgrade
+      # path through the same upgradeUuid, silently, exactly as UpdateInstaller.helperScript does.
+      - name: Reinstall with only /quiet /norestart, as the app's own updater does
+        shell: pwsh
+        run: |
+          $exe = "${{ runner.temp }}\installer.exe"
+          $p = Start-Process $exe -ArgumentList "/quiet","/norestart" -Wait -PassThru
+          Write-Host "Silent reinstall exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Write-Error "Reinstall failed with $($p.ExitCode)"; exit 1 }
+
+      - name: Read the marker after the silent reinstall
+        shell: pwsh
+        run: |
+          Start-Sleep -Seconds 3
+          $value = $null
+          try { $value = Get-ItemPropertyValue -LiteralPath $env:REG_KEY -Name InstallOrigin } catch { }
+          Write-Host "InstallOrigin after the app's own silent reinstall: '$value'"
+          if ($value -ne "store") { Write-Error "The updater's own reinstall must NEVER clear InstallOrigin. Got '$value'. The wxs component lost its Permanent=yes, or something else is removing the key."; exit 1 }
+
+  direct-download-install-writes-no-marker:
+    needs: build
+    runs-on: windows-2022
+    steps:
+      - name: Download the installer
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rating-prompt-installer
+          path: ${{ runner.temp }}
+
+      # A FRESH RUNNER, not the same machine the Store job used. That job's Permanent=yes component
+      # is never removed by an ordinary uninstall, so re-testing "no property means no key" on the
+      # same box would read a stale value left over from an earlier job rather than this install.
+      - name: Confirm the key does not already exist on this clean runner
+        shell: pwsh
+        run: |
+          $value = $null
+          try { $value = Get-ItemPropertyValue -LiteralPath $env:REG_KEY -Name InstallOrigin } catch { }
+          if ($null -ne $value) { Write-Error "This runner is not clean: InstallOrigin already '$value' before any install."; exit 1 }
+
+      - name: Install exactly as a direct download from revealthedream.com would
+        shell: pwsh
+        run: |
+          $exe = "${{ runner.temp }}\installer.exe"
+          $p = Start-Process $exe -ArgumentList "/quiet","/norestart" -Wait -PassThru
+          Write-Host "Direct-download install exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Write-Error "Install failed with $($p.ExitCode)"; exit 1 }
+
+      - name: Prove no marker was written
+        shell: pwsh
+        run: |
+          Start-Sleep -Seconds 3
+          $value = $null
+          try { $value = Get-ItemPropertyValue -LiteralPath $env:REG_KEY -Name InstallOrigin } catch { }
+          Write-Host "InstallOrigin after a direct-download install: '$value'"
+          if ($null -ne $value) { Write-Error "A direct download must never get InstallOrigin=store. Got '$value'."; exit 1 }
+
+  tray-look-and-feel:
+    runs-on: windows-2022
+    steps:
+      - name: Check out the PRIVATE source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/revealthedream
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Seed a journey so render-screens has something to draw
+        working-directory: android
+        shell: pwsh
+        run: ./gradlew ':desktop:run' '--console=plain' '-q' '--args=--verify onboard'
+
+      - name: Run the verification harness's render-screens action
+        working-directory: android
+        shell: pwsh
+        run: |
+          $out = & ./gradlew ':desktop:run' '--console=plain' '-q' '--args=--verify render-screens' 2>&1 | Out-String
+          Write-Host $out
+          $line = ($out -split "`r?`n" | Where-Object { $_ -match '^VERIFY_TRAY_LOOK_AND_FEEL:' } | Select-Object -Last 1)
+          if (-not $line) { Write-Error "render-screens did not print VERIFY_TRAY_LOOK_AND_FEEL: at all"; exit 1 }
+          Write-Host "Tray look and feel: $line"
+          if ($line -match '(?i)metal') { Write-Error "The tray popup is using Metal, not the Windows look and feel: $line"; exit 1 }
