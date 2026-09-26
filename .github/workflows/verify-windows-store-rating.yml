@@ -60,6 +60,26 @@ jobs:
         working-directory: android
         run: ./gradlew :desktop:packageExe --console=plain --no-daemon
 
+      - name: Diagnose whether jpackage picked up the main.wxs override
+        shell: pwsh
+        working-directory: android
+        run: |
+          Write-Host "----- our source file -----"
+          Get-Content "desktop\resources\windows\main.wxs" | Select-String -Pattern "StoreOriginMarker"
+          Write-Host "----- every main.wxs under desktop/build -----"
+          $found = Get-ChildItem -Recurse -Path "desktop\build" -Filter "main.wxs" -ErrorAction SilentlyContinue
+          if (-not $found) { Write-Host "NONE FOUND under desktop/build" }
+          foreach ($f in $found) {
+            Write-Host "=== $($f.FullName) ==="
+            $hit = Get-Content $f.FullName | Select-String -Pattern "StoreOriginMarker"
+            if ($hit) { Write-Host "CONTAINS StoreOriginMarker" } else { Write-Host "does NOT contain StoreOriginMarker (this is jpackage's plain default template)" }
+          }
+          Write-Host "----- packagedResourcesDir-shaped directories -----"
+          Get-ChildItem -Recurse -Directory -Path "desktop\build" -Filter "resources" -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "$($_.FullName):"
+            Get-ChildItem $_.FullName -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name)" }
+          }
+
       - name: Find the installer
         id: find
         shell: pwsh
