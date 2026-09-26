@@ -108,3 +108,17 @@ jobs:
             jpackage-capture-temp/**
             jpackage-capture-dest/**
           retention-days: 14
+
+      - name: Print main.wxs base64 to the log (blob storage is not reachable from this reviewer's network)
+        shell: pwsh
+        run: |
+          $wxs = Get-ChildItem -Recurse -Path jpackage-capture-temp -Filter main.wxs | Select-Object -First 1
+          if (-not $wxs) { Write-Error "main.wxs not found under jpackage-capture-temp"; exit 1 }
+          $bytes = [System.IO.File]::ReadAllBytes($wxs.FullName)
+          $b64 = [Convert]::ToBase64String($bytes)
+          Write-Host "-----BEGIN MAIN.WXS BASE64-----"
+          # Chunked so no single log line is unreasonably long.
+          for ($i = 0; $i -lt $b64.Length; $i += 120) {
+            Write-Host $b64.Substring($i, [Math]::Min(120, $b64.Length - $i))
+          }
+          Write-Host "-----END MAIN.WXS BASE64-----"
