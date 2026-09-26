@@ -92,7 +92,7 @@ jobs:
           if ($hits) { $hits | ForEach-Object { "$($_.Path):$($_.LineNumber): $($_.Line)" } }
           else { Write-Host "NONE FOUND: no <Variable>, no Overridable attribute, no <MsiProperty> anywhere in the generated bundle." }
 
-      - name: Baseline install (exactly tools/windows-store-install-parameters.txt: /quiet /norestart)
+      - name: "Baseline install: exactly tools/windows-store-install-parameters.txt (/quiet /norestart)"
         shell: pwsh
         run: |
           $exe = (Get-ChildItem out -Filter *.exe | Select-Object -First 1).FullName
