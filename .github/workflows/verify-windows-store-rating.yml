@@ -106,10 +106,24 @@ jobs:
       - name: Install as the Store would (STOREORIGIN=store)
         shell: pwsh
         run: |
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Force | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Name "Logging" -Value "voicewarmupx"
           $exe = "${{ runner.temp }}\installer.exe"
-          $p = Start-Process $exe -ArgumentList "/quiet","/norestart","STOREORIGIN=store" -Wait -PassThru
+          $log = "$env:RUNNER_TEMP\store-install.log"
+          $p = Start-Process $exe -ArgumentList "/quiet","/norestart","STOREORIGIN=store","/log","`"$log`"" -Wait -PassThru
           Write-Host "Store install exit code: $($p.ExitCode)"
           if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Write-Error "Install failed with $($p.ExitCode)"; exit 1 }
+          Write-Host "----- burn log(s) -----"
+          Get-ChildItem "$env:TEMP" -Filter "Reveal the Dream*.log" -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "=== $($_.FullName) ==="
+            Get-Content $_.FullName | Select-String -Pattern "STOREORIGIN|MsiProperty|Setting string variable|burn.exe|Command Line|PROPERTY" -CaseSensitive:$false
+          }
+          Write-Host "----- MSI verbose log, STOREORIGIN and StoreOriginMarker lines -----"
+          if (Test-Path $log) {
+            Get-Content $log | Select-String -Pattern "STOREORIGIN|StoreOriginMarker|PROPERTY CHANGE" -CaseSensitive:$false
+          } else {
+            Write-Host "No MSI log at $log"
+          }
 
       - name: Read the marker right after the Store install
         shell: pwsh
