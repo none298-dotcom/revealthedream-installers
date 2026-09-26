@@ -1,0 +1,208 @@
+name: EXPERIMENT - can a jpackage Burn EXE carry a Store-origin marker
+
+# THROWAWAY RESEARCH WORKFLOW. Not wired to any release. Answers one question: can Partner
+# Center's "Installer parameters" field (tools/windows-store-install-parameters.txt in the
+# private repo, currently "/quiet /norestart") smuggle an extra custom property THROUGH the
+# jpackage-built Burn bootstrapper EXE into the wrapped MSI, where it could be written to the
+# registry as a permanent "installed via the Store" marker?
+#
+# It builds a throwaway jpackage EXE with the SAME shape the real app uses (--type exe,
+# --win-per-user-install, a fixed --win-upgrade-uuid, on windows-2022), using --temp to keep
+# jpackage's generated WiX sources instead of deleting them, so the real bundle.wxs/main.wxs can
+# be read rather than guessed at. It then runs the built EXE with a custom, never-before-seen
+# public property on the command line (CUSTOMPROP=StoreValue) plus Burn's own /log switch, and
+# reads Burn's log for whether that property ever reached the wrapped msiexec invocation. As a
+# sanity check it repeats AGENTS.md's already-measured ALLUSERS=2 MSIINSTALLPERUSER=1 case for
+# comparison against a documented result.
+#
+# No file in the private repo is touched. This workflow deletes itself at the end of the run
+# that produced the evidence.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-2022
+    steps:
+      - name: Set up JDK 21 (jpackage lives here)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Confirm jpackage and WiX
+        shell: pwsh
+        run: |
+          & "$env:JAVA_HOME\bin\jpackage.exe" --version
+          # jpackage's exe/msi types shell out to WiX Toolset v3 (candle.exe/light.exe), which
+          # windows-2022 runner images ship pre-installed for exactly this reason.
+          $wixPath = $env:WIX
+          Write-Host "WIX env var: $wixPath"
+          Get-ChildItem "$wixPath\bin" -Filter *.exe | Select-Object Name
+
+      - name: Build a minimal Hello World app to package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path in, out, tmp | Out-Null
+          @'
+          public class Hello {
+              public static void main(String[] args) throws Exception {
+                  // Idle so a CI step could attach if it ever needed to; not used here.
+                  Thread.sleep(200);
+              }
+          }
+          '@ | Set-Content -Path Hello.java -Encoding UTF8
+          & "$env:JAVA_HOME\bin\javac.exe" Hello.java
+          & "$env:JAVA_HOME\bin\jar.exe" --create --file in\hello.jar --main-class Hello Hello.class
+
+      - name: jpackage --type exe, --temp kept (this is what reveals the generated WiX authoring)
+        shell: pwsh
+        run: |
+          & "$env:JAVA_HOME\bin\jpackage.exe" `
+            --type exe `
+            --name ExpApp `
+            --app-version 1.0.0 `
+            --input in `
+            --main-jar hello.jar `
+            --main-class Hello `
+            --dest out `
+            --temp tmp `
+            --win-per-user-install `
+            --win-dir-chooser `
+            --win-upgrade-uuid 11111111-1111-1111-1111-111111111111 `
+            --verbose
+          if ($LASTEXITCODE -ne 0) { throw "jpackage failed with $LASTEXITCODE" }
+          Get-ChildItem out
+
+      - name: Dump jpackage's generated WiX authoring (this is the actual evidence, not a guess)
+        shell: pwsh
+        run: |
+          Write-Host "===== .wxs / .wxi files jpackage generated ====="
+          Get-ChildItem tmp -Recurse -Include *.wxs, *.wxi, *.wxl | ForEach-Object {
+            Write-Host "----- $($_.FullName) -----"
+            Get-Content $_.FullName
+          }
+          Write-Host "===== Does the generated bundle declare ANY overridable Variable or MsiProperty? ====="
+          $hits = Get-ChildItem tmp -Recurse -Include *.wxs, *.wxi |
+            Select-String -Pattern 'Overridable|MsiProperty|<Variable' -SimpleMatch:$false
+          if ($hits) { $hits | ForEach-Object { "$($_.Path):$($_.LineNumber): $($_.Line)" } }
+          else { Write-Host "NONE FOUND: no <Variable>, no Overridable attribute, no <MsiProperty> anywhere in the generated bundle." }
+
+      - name: Baseline install (exactly tools/windows-store-install-parameters.txt: /quiet /norestart)
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem out -Filter *.exe | Select-Object -First 1).FullName
+          Write-Host "Installer: $exe"
+          $p = Start-Process -FilePath $exe -ArgumentList '/quiet','/norestart','/log',(Join-Path $PWD 'baseline-burn.log') -PassThru -Wait
+          Write-Host "Exit code: $($p.ExitCode)"
+
+      - name: Read the baseline Burn log
+        shell: pwsh
+        run: |
+          Get-Content baseline-burn.log
+
+      - name: Uninstall the baseline copy before the next trial
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $uninst = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -eq 'ExpApp' }
+          if ($uninst) {
+            Write-Host "Uninstalling via: $($uninst.UninstallString)"
+            Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList '/c', $uninst.UninstallString, '/quiet', '/norestart' -Wait
+          } else {
+            Write-Host "No HKCU uninstall entry found (checking HKLM for visibility only, per-user should not be there)"
+            Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -eq 'ExpApp' } | Format-List
+          }
+
+      - name: Trial A - a CUSTOM never-declared public property on the command line
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem out -Filter *.exe | Select-Object -First 1).FullName
+          $p = Start-Process -FilePath $exe -ArgumentList '/quiet','/norestart','CUSTOMPROP=StoreValue','/log',(Join-Path $PWD 'customprop-burn.log') -PassThru -Wait
+          Write-Host "Exit code: $($p.ExitCode)"
+
+      - name: Read Trial A's Burn log and search for the property
+        shell: pwsh
+        run: |
+          Get-Content customprop-burn.log
+          Write-Host "===== grep for CUSTOMPROP in the log ====="
+          $found = Select-String -Path customprop-burn.log -Pattern 'CUSTOMPROP'
+          if ($found) { $found } else { Write-Host "CUSTOMPROP NEVER APPEARS IN THE LOG AT ALL." }
+          Write-Host "===== grep for the msiexec command line Burn actually built ====="
+          Select-String -Path customprop-burn.log -Pattern 'MsiExec|Setting (MSI )?(string|numeric) (property|variable)|Applying execute package'
+
+      - name: Did the custom property reach the registry, anywhere reachable, after Trial A?
+        shell: pwsh
+        run: |
+          $hklmHit = Get-ChildItem 'HKLM:\SOFTWARE' -Recurse -ErrorAction SilentlyContinue 2>$null |
+            Where-Object { $_.Name -match 'ExpApp' } | Select-Object -First 5
+          $hkcuHit = Get-ChildItem 'HKCU:\SOFTWARE' -Recurse -ErrorAction SilentlyContinue 2>$null |
+            Where-Object { $_.Name -match 'ExpApp' } | Select-Object -First 20
+          Write-Host "===== HKCU keys mentioning ExpApp ====="
+          $hkcuHit | ForEach-Object { $_.Name }
+          foreach ($k in $hkcuHit) {
+            try { Get-ItemProperty -LiteralPath $k.PSPath | Format-List } catch {}
+          }
+          Write-Host "===== Any value anywhere under HKCU containing the literal StoreValue? ====="
+          $reg = & reg.exe query 'HKCU\SOFTWARE' /s /f 'StoreValue' 2>&1
+          if ($reg) { $reg } else { Write-Host "reg.exe found no match for StoreValue under HKCU\SOFTWARE" }
+
+      - name: Uninstall before Trial B
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $uninst = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -eq 'ExpApp' }
+          if ($uninst) {
+            Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList '/c', $uninst.UninstallString, '/quiet', '/norestart' -Wait
+          }
+
+      - name: Trial B - reconfirm AGENTS.md's ALLUSERS/MSIINSTALLPERUSER result on THIS build, same method
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem out -Filter *.exe | Select-Object -First 1).FullName
+          $p = Start-Process -FilePath $exe -ArgumentList '/quiet','/norestart','ALLUSERS=2','MSIINSTALLPERUSER=1','/log',(Join-Path $PWD 'alluserstest-burn.log') -PassThru -Wait
+          Write-Host "Exit code: $($p.ExitCode)"
+          $msi = New-Object -ComObject WindowsInstaller.Installer
+          $products = $msi.GetType().InvokeMember('Products', 'GetProperty', $null, $msi, @())
+          foreach ($prod in $products) {
+            $name = $msi.GetType().InvokeMember('ProductInfo', 'GetProperty', $null, $msi, @($prod, 'ProductName'))
+            if ($name -eq 'ExpApp') {
+              $assignment = $msi.GetType().InvokeMember('ProductInfo', 'GetProperty', $null, $msi, @($prod, 'AssignmentType'))
+              Write-Host "ExpApp AssignmentType (0=per-user, 1=per-machine): $assignment"
+            }
+          }
+
+      - name: Read Trial B's Burn log
+        shell: pwsh
+        run: |
+          Get-Content alluserstest-burn.log
+          Write-Host "===== grep for ALLUSERS / MSIINSTALLPERUSER in the log ====="
+          Select-String -Path alluserstest-burn.log -Pattern 'ALLUSERS|MSIINSTALLPERUSER'
+
+      - name: Final uninstall
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $uninst = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -eq 'ExpApp' }
+          if ($uninst) {
+            Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList '/c', $uninst.UninstallString, '/quiet', '/norestart' -Wait
+          }
+
+      - name: Upload logs and generated WiX sources as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: store-origin-marker-experiment
+          path: |
+            *-burn.log
+            tmp/**/*.wxs
+            tmp/**/*.wxi
+          if-no-files-found: warn
