@@ -1,0 +1,418 @@
+name: Render the Windows widget card (real template, real renderer)
+
+# PROVES WHETHER THE CARD CLIPS OR CROWDS AT THE WIDGETS BOARD'S OWN SIZES, WITH A REAL ADAPTIVE
+# CARDS RENDERER, NOT A HAND-DRAWN STAND-IN.
+#
+# tools/windows-widget-card-verify.ps1 (this app's private repo, run against an installed build)
+# proves the WORDS on the tile: it re-derives headline/subline/startDateText from the payload with
+# the same arithmetic RevealWidgetProvider.CardData uses, and asserts on the strings. It draws a
+# picture too, with System.Drawing text at two hardcoded coordinates -- not a real Adaptive Card
+# layout, so it cannot see wrapping, truncation, or one TextBlock's maxLines clipping another
+# element off the bottom of the card. Nobody had ever rendered RevealWidgetProvider's ACTUAL
+# CardTemplate/CardData JSON through an Adaptive Cards renderer at the Widgets Board's own sizes.
+#
+# This job does that, in four stages:
+#   1. Build the real provider assembly (Build, not Publish -- trimming is a Publish-only step and
+#      buys nothing for a reflection target; see build-and-verify-windows.yml's build-widget job
+#      for why Publish is needed there and not here).
+#   2. Write a REAL fixture payload to %APPDATA%\RevealTheDream\widget -- a long journey title, a
+#      countdown line, and a start-date line ("Started Sep 16") -- the disposable runner's own
+#      per-user folder, exactly where the app itself would write it and where
+#      tools/windows-widget-card-verify.ps1 already reads it from.
+#   3. Call CardTemplate/CardData/ReadCatalog BY REFLECTION against that fixture, because those are
+#      PRIVATE STATIC methods with no host dependency (WidgetManager is only touched by
+#      UpdateWidget, which this never calls). Reflection means the JSON under test is the exact
+#      string the provider would send to the host, not a second hand-written copy of the formula --
+#      windows-widget-card-verify.ps1's own header already warns what happens to a hand-written
+#      mirror once the provider changes and the mirror does not.
+#   4. Expand that template+data pair with the REAL adaptivecards-templating engine (which is what
+#      resolves $host.widgetSize and every $when, exactly as the Widgets host does before handing
+#      the card to Adaptive Cards for layout) and render it with the REAL "adaptivecards" JS
+#      renderer, inside a frame sized and padded exactly like Microsoft's own Adaptive Cards
+#      Designer "Widgets Board" preview: 302px outer width, 48px top padding for the attribution
+#      area, 16px side/bottom margins, and 146/304/462px card heights for small/medium/large.
+#      (source/nodejs/adaptivecards-designer/src/containers/widget/widget-container-{light,dark}.css
+#      in microsoft/AdaptiveCards, MIT licensed -- the same numbers the Adaptive Cards Designer's
+#      own "Select host app: Widgets Board" preview uses.) The frame has overflow:hidden, so a card
+#      too tall for its size is CLIPPED in the screenshot exactly as the real Widgets Board would
+#      clip it, rather than just spilling past an invisible boundary in the PNG.
+#
+# WHAT THIS PROVES AND WHAT IT DOES NOT. It proves the real card's layout, wrapping, and truncation
+# at three sizes and two themes, off the real template and the real data. It does NOT run inside the
+# actual Widgets Board host (no Windows Server runner has one, and this workflow's sibling
+# verify-windows-widget.yml already says why) and it does not reproduce the host's own chrome --
+# the attribution row's icon and app name, the more-button -- pixel for pixel, only Adaptive Cards'
+# OWN layout of the body this provider controls, which is the whole surface a card change can break.
+# Saying so is the point: a gate that overclaims is worse than one that stops early.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Private repo ref to render the widget card from"
+        default: "main"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  render-card:
+    permissions:
+      contents: read
+    # Same image as every other Windows job here, for the same reason: windows-latest moved to
+    # Server 2025 and made a byte-identical installer pass 1 run in 6. This job builds a Windows-
+    # targeted assembly (net8.0-windows10.0.22621.0), so it needs the Windows SDK the image ships,
+    # even though the render step itself is plain cross-platform Node.
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out the PRIVATE source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/revealthedream
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - name: .NET 8 for the widget provider
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: MSBuild
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
+
+      - name: Node for the Adaptive Cards renderer
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Build the widget provider
+        shell: pwsh
+        working-directory: windows/WidgetProvider
+        run: |
+          dotnet restore RevealWidgetProvider.csproj -r win-x64
+          if ($LASTEXITCODE -ne 0) { Write-Error "Restore failed"; exit 1 }
+
+          # BUILD, NOT PUBLISH. PublishTrimmed only runs on Publish, and trimming buys nothing for
+          # an assembly nothing will ship -- this DLL exists only to be loaded by the reflection
+          # harness below and thrown away at the end of the job.
+          msbuild RevealWidgetProvider.csproj /t:Build /p:Configuration=Release /p:Platform=x64 /v:minimal /nologo
+          if ($LASTEXITCODE -ne 0) { Write-Error "Widget provider does not build"; exit 1 }
+
+          $dll = Get-ChildItem -Recurse -Filter RevealWidgetProvider.dll -Path "bin/x64/Release" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) { Write-Error "No RevealWidgetProvider.dll under bin/x64/Release"; exit 1 }
+          Write-Host "Provider assembly: $($dll.FullName)"
+          "providerDll=$($dll.FullName)" >> $env:GITHUB_ENV
+
+      - name: Write a REAL fixture payload (long title, countdown line, start date)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:APPDATA "RevealTheDream\widget"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+          # Two catalog entries, not one: CardTemplate(severalJourneys: true) adds a "Change
+          # journey" button to the ActionSet, which is MORE vertical pressure on the card than the
+          # single-journey case, and that is the case worth proving clean.
+          $longId = "11111111-1111-4111-8111-111111111111"
+          $shortId = "22222222-2222-4222-8222-222222222222"
+          $middot = [char]0x00B7
+
+          $catalog = [ordered]@{
+            selectedJourneyID = $longId
+            journeys = @(
+              [ordered]@{ id = $longId; title = "Walk the entire West Highland Way before my sister's wedding in Skye" }
+              [ordered]@{ id = $shortId; title = "Trip to Rome" }
+            )
+          }
+          $catalog | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $dir "widget-journey-catalog.json") -Encoding UTF8
+
+          # The long journey: everything the task asked to stress -- a long title, a real
+          # countdown line in the shared "Opens H:MM AM/PM · in ..." shape
+          # (CheckInCountdownLine.staticLine), and a start-date line in the real
+          # "Started Mon D" shape (StartDateLabelPolicy.label). This is the card that used to
+          # append the start date onto the end of the status line.
+          $journeyLong = [ordered]@{
+            title = "Walk the entire West Highland Way before my sister's wedding in Skye"
+            statusText = "Not open yet"
+            totalDays = 90
+            currentDayIndex = 46
+            countdownLine = "Opens 9:00 PM $middot in 4h 12m"
+            startDateText = "Started Sep 16"
+          }
+          $journeyLong | ConvertTo-Json | Set-Content -Path (Join-Path $dir "widget-journey-$longId.json") -Encoding UTF8
+
+          # The second catalog entry needs its own payload too, or it hits CardData's
+          # half-written-catalog branch instead of the ordinary one -- a different scenario than
+          # the one this fixture exists to prove, and not the one selected anyway
+          # (selectedJourneyID above points at the long journey).
+          $journeyShort = [ordered]@{
+            title = "Trip to Rome"
+            statusText = "Check-in open"
+            totalDays = 10
+            currentDayIndex = 3
+            countdownLine = ""
+            startDateText = ""
+          }
+          $journeyShort | ConvertTo-Json | Set-Content -Path (Join-Path $dir "widget-journey-$shortId.json") -Encoding UTF8
+
+          # Real JPEG bytes, not zero-byte stand-ins: ToDataUri reads the file and base64-encodes
+          # it, and a missing or unreadable image is a different code path (the image Container is
+          # $when-gated on `image != ''`).
+          Add-Type -AssemblyName System.Drawing
+          foreach ($id in @($longId, $shortId)) {
+            $bmp = New-Object System.Drawing.Bitmap(320, 320)
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.Clear([System.Drawing.Color]::FromArgb(90, 110, 96))
+            $g.Dispose()
+            $bmp.Save((Join-Path $dir "widget-journey-$id.jpg"), [System.Drawing.Imaging.ImageFormat]::Jpeg)
+            $bmp.Dispose()
+          }
+
+          Write-Host "Fixture written to $dir"
+          Get-ChildItem $dir | ForEach-Object { Write-Host "  $($_.Name)  $($_.Length) bytes" }
+
+      - name: Get the REAL card template and data, by reflection, from the built provider
+        shell: pwsh
+        run: |
+          $harness = "$env:RUNNER_TEMP\card-harness"
+          New-Item -ItemType Directory -Force -Path $harness | Out-Null
+
+          Set-Content -Path "$harness\Harness.csproj" -Value @'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0-windows10.0.22621.0</TargetFramework>
+              <Nullable>enable</Nullable>
+              <AssemblyName>CardHarness</AssemblyName>
+            </PropertyGroup>
+          </Project>
+          '@
+
+          # BY REFLECTION AGAINST THE REAL ASSEMBLY, NOT A SECOND COPY OF THE FORMULA. ReadCatalog,
+          # CardTemplate and CardData are private static methods with no WidgetManager/host
+          # dependency at all -- only UpdateWidget touches the host, and this harness never calls
+          # it -- so they can be invoked directly from outside the class with no live Widgets Board
+          # anywhere near this machine.
+          Set-Content -Path "$harness\Harness.cs" -Value @'
+          using System;
+          using System.Collections;
+          using System.IO;
+          using System.Reflection;
+
+          var providerDllPath = args[0];
+          var outDir = args[1];
+          Directory.CreateDirectory(outDir);
+
+          var asm = Assembly.LoadFrom(providerDllPath);
+          var providerType = asm.GetType("RevealTheDream.Widgets.RevealWidgetProvider", throwOnError: true)!;
+          const BindingFlags flags = BindingFlags.NonPublic | BindingFlags.Static;
+
+          var readCatalog = providerType.GetMethod("ReadCatalog", flags) ?? throw new Exception("ReadCatalog not found by reflection");
+          var cardTemplateMethod = providerType.GetMethod("CardTemplate", flags) ?? throw new Exception("CardTemplate not found by reflection");
+          var cardDataMethod = providerType.GetMethod("CardData", flags) ?? throw new Exception("CardData not found by reflection");
+
+          object catalog = readCatalog.Invoke(null, null) ?? throw new Exception("ReadCatalog returned null");
+          var entries = (IList)catalog.GetType().GetProperty("Entries")!.GetValue(catalog)!;
+          bool several = entries.Count > 1;
+          Console.WriteLine($"ReadCatalog: {entries.Count} catalog entries, severalJourneys={several}");
+
+          // chosenJourneyId=null mirrors a widget with no custom state chosen yet, which is
+          // UpdateWidget's own default and falls back to catalog.SelectedId -- the long journey in
+          // this fixture.
+          var template = (string)cardTemplateMethod.Invoke(null, new object?[] { several })!;
+          var data = (string)cardDataMethod.Invoke(null, new object?[] { catalog, null })!;
+
+          File.WriteAllText(Path.Combine(outDir, "template.json"), template);
+          File.WriteAllText(Path.Combine(outDir, "data.json"), data);
+          Console.WriteLine("---- template.json ----");
+          Console.WriteLine(template);
+          Console.WriteLine("---- data.json ----");
+          Console.WriteLine(data);
+          '@
+
+          $cardJson = "$env:RUNNER_TEMP\card-json"
+          dotnet run --project "$harness\Harness.csproj" -c Release -- "$env:providerDll" "$cardJson"
+          if ($LASTEXITCODE -ne 0) { Write-Error "The reflection harness could not build or run against RevealWidgetProvider.dll"; exit 1 }
+          if (-not (Test-Path "$cardJson\data.json") -or -not (Test-Path "$cardJson\template.json")) {
+            Write-Error "The harness ran but did not write both template.json and data.json"; exit 1
+          }
+
+          # THE BUG THIS WHOLE JOB EXISTS FOR, CHECKED ON THE REAL JSON BEFORE ANY RENDERING.
+          # If this ever reappears -- the start date folded back into the status line rather than
+          # its own field -- fail here, immediately, rather than relying on somebody looking hard
+          # enough at a screenshot to notice a long line.
+          $data = Get-Content "$cardJson\data.json" -Raw | ConvertFrom-Json
+          if ($null -eq $data.startDateText) { Write-Error "data.json has no startDateText field at all -- CardData/Card() regressed."; exit 1 }
+          if ($data.subline -match [regex]::Escape($data.startDateText) -and $data.startDateText.Length -gt 0) {
+            Write-Error "The start date is back inside 'subline' ($($data.subline)) instead of its own 'startDateText' field. That is the bug this job exists to catch."
+            exit 1
+          }
+          Write-Host "ok: startDateText ('$($data.startDateText)') is its own field, not folded into subline ('$($data.subline)')"
+
+      - name: Install the Adaptive Cards renderer and templating engine (pinned versions)
+        shell: pwsh
+        run: |
+          $render = "$env:RUNNER_TEMP\render"
+          New-Item -ItemType Directory -Force -Path $render | Out-Null
+          Set-Location $render
+          npm init -y | Out-Null
+          # Pinned, not @latest: this is a proof, and a proof that silently renders through a
+          # different version next month is not the same proof. adaptive-expressions is a direct
+          # dependency of adaptivecards-templating from v2.0 on (it used to be bundled); Node's
+          # plain require() resolves it from node_modules like any other package.
+          npm install --no-save adaptivecards@3.0.6 adaptivecards-templating@2.3.1 adaptive-expressions@4.23.3 puppeteer@25.12.0
+          if ($LASTEXITCODE -ne 0) { Write-Error "npm install failed"; exit 1 }
+          if (-not (Test-Path "$render\node_modules\adaptivecards\dist\adaptivecards.min.js")) { Write-Error "adaptivecards.min.js did not install where expected"; exit 1 }
+
+      - name: Render the REAL card at small/medium/large, light/dark
+        shell: pwsh
+        run: |
+          $render = "$env:RUNNER_TEMP\render"
+
+          # THE FRAME IS MICROSOFT'S OWN, NOT GUESSED. These are the literal numbers from
+          # source/nodejs/adaptivecards-designer/src/containers/widget/widget-container-{light,dark}.css
+          # in microsoft/AdaptiveCards (MIT licensed) -- the same CSS the Adaptive Cards Designer's
+          # "Select host app: Widgets Board" preview uses: 302px outer width, 48px top padding for
+          # the attribution area, 16px side/bottom margins, 146/304/462px card heights. This project
+          # has no Widgets Board of its own to measure from; reusing Microsoft's own preview
+          # geometry is the closest thing to it that runs on a server.
+          Set-Content -Path "$render\render-widget-card.js" -Value @'
+          const fs = require("fs");
+          const path = require("path");
+          const { Template } = require("adaptivecards-templating");
+          const puppeteer = require("puppeteer");
+
+          const cardJsonDir = process.argv[2];
+          const outDir = process.argv[3];
+          const acMinJsPath = process.argv[4];
+
+          fs.mkdirSync(outDir, { recursive: true });
+
+          const templateJson = JSON.parse(fs.readFileSync(path.join(cardJsonDir, "template.json"), "utf8"));
+          const dataJson = JSON.parse(fs.readFileSync(path.join(cardJsonDir, "data.json"), "utf8"));
+          const acScript = fs.readFileSync(acMinJsPath, "utf8");
+          const template = new Template(templateJson);
+
+          const FRAME = {
+            small: { height: 146 },
+            medium: { height: 304 },
+            large: { height: 462 },
+          };
+          const THEME = {
+            light: { background: "#f6f6f6", border: "rgba(0,0,0,0.15)", defaultColor: "#1B1B1B", subtleColor: "rgba(0,0,0,0.65)" },
+            dark: { background: "#2c2c2c", border: "rgba(255,255,255,0.2)", defaultColor: "#FFFFFF", subtleColor: "rgba(255,255,255,0.65)" },
+          };
+
+          (async () => {
+            const browser = await puppeteer.launch();
+            let anyOverflow = false;
+            for (const size of Object.keys(FRAME)) {
+              for (const theme of Object.keys(THEME)) {
+                const hostData = {
+                  widgetSize: size,
+                  hostTheme: theme,
+                  isSettingsPayload: false,
+                  isHeaderSupported: false,
+                  isHeader: false,
+                  isWebSupported: true,
+                  isUserContextAuthenticated: true,
+                };
+                const expanded = template.expand({ $root: dataJson, $host: hostData });
+                fs.writeFileSync(path.join(outDir, `expanded-${size}-${theme}.json`), JSON.stringify(expanded, null, 2));
+
+                const t = THEME[theme];
+                const frameHeight = FRAME[size].height;
+                const html = `<!doctype html><html><head><meta charset="utf-8"><style>
+                  html,body { margin:0; padding:0; background:#808080; }
+                  #outer {
+                    width: 302px;
+                    height: ${frameHeight}px;
+                    background: ${t.background};
+                    border: 1px solid ${t.border};
+                    border-radius: 8px;
+                    box-sizing: border-box;
+                    overflow: hidden;
+                    position: relative;
+                    font-family: "Segoe UI", Arial, sans-serif;
+                  }
+                  #card-slot { position: absolute; top: 48px; left: 16px; right: 16px; bottom: 16px; }
+                  .ac-adaptiveCard { margin: 0 !important; padding: 0 !important; border: 0 !important; }
+                </style></head><body><div id="outer"><div id="card-slot"></div></div></body></html>`;
+
+                const page = await browser.newPage();
+                await page.setViewport({ width: 340, height: frameHeight + 80 });
+                await page.setContent(html);
+                await page.addScriptTag({ content: acScript });
+                await page.evaluate((cardPayload, colors) => {
+                  const hostConfig = new AdaptiveCards.HostConfig({
+                    fontFamily: "Segoe UI, Arial, sans-serif",
+                    containerStyles: {
+                      default: {
+                        foregroundColors: {
+                          default: { default: colors.defaultColor, subtle: colors.subtleColor },
+                          accent: { default: "#4CC2FF", subtle: "#4CC2FF" },
+                        },
+                        backgroundColor: "transparent",
+                      },
+                    },
+                    actions: { actionsOrientation: "horizontal", spacing: "small" },
+                  });
+                  const card = new AdaptiveCards.AdaptiveCard();
+                  card.hostConfig = hostConfig;
+                  card.parse(cardPayload);
+                  const rendered = card.render();
+                  document.getElementById("card-slot").appendChild(rendered);
+                }, expanded, { defaultColor: t.defaultColor, subtleColor: t.subtleColor });
+
+                // DOES THE REAL CONTENT OVERFLOW THE 48/16/16/16 CONTENT BOX, before the outer
+                // frame's overflow:hidden silently eats the evidence? The screenshot shows the
+                // clip either way; this makes it a fact in the log too, not just a picture someone
+                // has to notice is short a line.
+                const overflow = await page.evaluate(() => {
+                  const slot = document.getElementById("card-slot");
+                  const card = slot.firstElementChild;
+                  return card ? card.scrollHeight - slot.clientHeight : 0;
+                });
+                if (overflow > 0) {
+                  anyOverflow = true;
+                  console.log(`OVERFLOW ${size}/${theme}: content is ${overflow}px taller than the content box -- the bottom is clipped by the real widget frame.`);
+                } else {
+                  console.log(`ok ${size}/${theme}: content fits (${-overflow}px to spare)`);
+                }
+
+                const outer = await page.$("#outer");
+                await outer.screenshot({ path: path.join(outDir, `${size}-${theme}.png`) });
+                await page.close();
+              }
+            }
+            await browser.close();
+            fs.writeFileSync(path.join(outDir, "OVERFLOW_DETECTED.txt"), String(anyOverflow));
+          })().catch((err) => { console.error(err); process.exit(1); });
+          '@
+
+          $out = "$env:RUNNER_TEMP\widget-card-render"
+          node "$render\render-widget-card.js" "$env:RUNNER_TEMP\card-json" $out "$render\node_modules\adaptivecards\dist\adaptivecards.min.js"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Rendering the card failed"; exit 1 }
+
+          Copy-Item "$env:RUNNER_TEMP\card-json\template.json" $out
+          Copy-Item "$env:RUNNER_TEMP\card-json\data.json" $out
+          Write-Host ""
+          Write-Host "==> Rendered files"
+          Get-ChildItem $out | ForEach-Object { Write-Host "  $($_.Name)  $($_.Length) bytes" }
+
+          $flag = Get-Content (Join-Path $out "OVERFLOW_DETECTED.txt") -Raw
+          if ($flag.Trim() -eq "True") {
+            Write-Error "At least one size/theme overflowed its content box -- see the OVERFLOW lines above and the PNGs in the uploaded artifact. This is exactly the class of bug this job exists to catch; it does not need a human to notice a screenshot looks short a line."
+            exit 1
+          }
+          Write-Host "ok: no size/theme overflowed its content box"
+
+      - name: Upload the rendered card
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-widget-card-render
+          path: ${{ runner.temp }}/widget-card-render/*
+          if-no-files-found: error
