@@ -118,9 +118,12 @@ jobs:
             Write-Host "=== $($_.FullName) ==="
             Get-Content $_.FullName | Select-String -Pattern "STOREORIGIN|MsiProperty|Setting string variable|burn.exe|Command Line|PROPERTY" -CaseSensitive:$false
           }
-          Write-Host "----- MSI verbose log, STOREORIGIN and StoreOriginMarker lines -----"
+          Write-Host "----- MSI verbose log, broad search -----"
           if (Test-Path $log) {
-            Get-Content $log | Select-String -Pattern "STOREORIGIN|StoreOriginMarker|PROPERTY CHANGE" -CaseSensitive:$false
+            Write-Host "Log size: $((Get-Item $log).Length) bytes"
+            Get-Content $log | Select-String -Pattern "StoreOriginMarker|InstallOrigin|Little Bird|WriteRegistryValues|ComponentId|CreateFolders|ProcessComponents" -CaseSensitive:$false | Select-Object -First 200
+            Write-Host "----- CostFinalize component action states -----"
+            Get-Content $log | Select-String -Pattern "^Action start.*CostFinalize|^Action ended.*CostFinalize" -CaseSensitive:$false
           } else {
             Write-Host "No MSI log at $log"
           }
