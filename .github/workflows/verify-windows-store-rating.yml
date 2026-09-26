@@ -148,7 +148,7 @@ jobs:
             Write-Host "No MSI log at $log"
           }
 
-      - name: Inspect the installed MSI's own tables directly (bypasses log-parsing guesswork)
+      - name: Decompile the installed MSI with dark.exe and search for our component
         shell: pwsh
         run: |
           $installer = New-Object -ComObject WindowsInstaller.Installer
@@ -158,30 +158,18 @@ jobs:
           if (-not $code) { Write-Error "No related product found for the upgrade code"; exit 1 }
           Write-Host "ProductCode: $code"
           $localPackage = $installer.GetType().InvokeMember('ProductInfo', 'GetProperty', $null, $installer, @($code, 'LocalPackage'))
-          Write-Host "LocalPackage (cached MSI): $localPackage"
-          $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($localPackage, 0))
-          function Query($sql) {
-            $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @($sql))
-            $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
-            $rows = @()
-            while ($true) {
-              $rec = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
-              if (-not $rec) { break }
-              $cols = $rec.GetType().InvokeMember('FieldCount', 'GetProperty', $null, $rec, $null)
-              $vals = @()
-              for ($i = 1; $i -le $cols; $i++) { $vals += $rec.GetType().InvokeMember('StringData', 'GetProperty', $null, $rec, @($i)) }
-              $rows += ($vals -join ' | ')
-            }
-            return $rows
-          }
-          Write-Host "----- Component table rows mentioning StoreOrigin -----"
-          Query("SELECT * FROM Component") | Where-Object { $_ -match 'StoreOrigin' } | ForEach-Object { Write-Host $_ }
-          Write-Host "----- Registry table rows mentioning InstallOrigin -----"
-          Query("SELECT * FROM Registry") | Where-Object { $_ -match 'InstallOrigin' } | ForEach-Object { Write-Host $_ }
-          Write-Host "----- Condition table (component conditions) -----"
-          try { Query("SELECT * FROM Condition") | ForEach-Object { Write-Host $_ } } catch { Write-Host "No Condition table (component conditions may live in the Component table's Condition column instead)" }
-          Write-Host "----- FeatureComponents rows for StoreOriginMarker -----"
-          Query("SELECT * FROM FeatureComponents") | Where-Object { $_ -match 'StoreOrigin' } | ForEach-Object { Write-Host $_ }
+          Write-Host "LocalPackage (cached MSI): $localPackage  size=$((Get-Item $localPackage).Length) bytes"
+          $dark = Get-ChildItem -Path "$env:WIX" -Filter "dark.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dark) { Write-Error "dark.exe not found under `$env:WIX ($env:WIX)"; exit 1 }
+          $decompiled = "$env:RUNNER_TEMP\installed.wxs"
+          & $dark.FullName $localPackage $decompiled
+          Write-Host "dark.exe exit code: $LASTEXITCODE"
+          if (-not (Test-Path $decompiled)) { Write-Error "dark.exe produced no output"; exit 1 }
+          Write-Host "----- decompiled Component/Registry entries -----"
+          $hits = Get-Content $decompiled | Select-String -Pattern "StoreOrigin|InstallOrigin|Little Bird Trading LLC.\\Reveal the Dream"
+          if ($hits) { $hits | ForEach-Object { Write-Host $_ } } else { Write-Host "NO MATCHES -- the installed MSI has no trace of our component at all" }
+          Write-Host "----- total <Component> count in the installed MSI -----"
+          (Get-Content $decompiled | Select-String -Pattern "<Component ").Count
 
       - name: Read the marker right after the Store install
         shell: pwsh
