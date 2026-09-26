@@ -105,96 +105,139 @@ jobs:
         run: |
           Get-Content baseline-burn.log
 
-      - name: Uninstall the baseline copy before the next trial
+      - name: Helper functions (product code lookup, clean removal via msiexec, not registry guessing)
         shell: pwsh
-        continue-on-error: true
         run: |
-          $uninst = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -eq 'ExpApp' }
-          if ($uninst) {
-            Write-Host "Uninstalling via: $($uninst.UninstallString)"
-            Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList '/c', $uninst.UninstallString, '/quiet', '/norestart' -Wait
-          } else {
-            Write-Host "No HKCU uninstall entry found (checking HKLM for visibility only, per-user should not be there)"
-            Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
-              Where-Object { $_.DisplayName -eq 'ExpApp' } | Format-List
+          @'
+          function Get-ExpAppProductCode {
+            $msi = New-Object -ComObject WindowsInstaller.Installer
+            $related = $msi.GetType().InvokeMember('RelatedProducts', 'GetProperty', $null, $msi, @('{11111111-1111-1111-1111-111111111111}'))
+            $codes = @($related)
+            if ($codes.Count -ge 1) { return $codes[0] } else { return $null }
           }
+          function Get-ExpAppProductInfo([string]$code, [string]$prop) {
+            $msi = New-Object -ComObject WindowsInstaller.Installer
+            try { return $msi.GetType().InvokeMember('ProductInfo', 'GetProperty', $null, $msi, @($code, $prop)) }
+            catch { return $null }
+          }
+          function Remove-ExpApp {
+            $code = Get-ExpAppProductCode
+            if ($code) {
+              Write-Host "Removing product $code via msiexec /x"
+              $p = Start-Process -FilePath msiexec.exe -ArgumentList '/x', $code, '/quiet', '/norestart' -PassThru -Wait
+              Write-Host "msiexec /x exit code: $($p.ExitCode)"
+            } else {
+              Write-Host "No related product found for the upgrade code (already clean)"
+            }
+          }
+          '@ | Set-Content -Path helpers.ps1 -Encoding UTF8
 
-      - name: Trial A - a CUSTOM never-declared public property on the command line
+      - name: Confirm clean state right after baseline (prove the product IS registered)
+        shell: pwsh
+        run: |
+          . .\helpers.ps1
+          $code = Get-ExpAppProductCode
+          Write-Host "Product code after baseline install: $code"
+          if (-not $code) { throw "baseline install did not register a product - the whole experiment rests on this" }
+
+      - name: Uninstall the baseline copy cleanly (msiexec /x by product code)
+        shell: pwsh
+        run: |
+          . .\helpers.ps1
+          Remove-ExpApp
+          $code = Get-ExpAppProductCode
+          if ($code) { throw "still registered after uninstall: $code" }
+          Write-Host "Confirmed clean: no related product registered"
+
+      - name: Trial A - a fresh install with a CUSTOM never-declared public property
         shell: pwsh
         run: |
           $exe = (Get-ChildItem out -Filter *.exe | Select-Object -First 1).FullName
           $p = Start-Process -FilePath $exe -ArgumentList '/quiet','/norestart','CUSTOMPROP=StoreValue','/log',(Join-Path $PWD 'customprop-burn.log') -PassThru -Wait
           Write-Host "Exit code: $($p.ExitCode)"
+          Select-String -Path customprop-burn.log -Pattern '^(Action (start|ended) .*: (INSTALL|InstallFinalize)\.|Installation completed successfully|reconfigured the product)'
 
       - name: Read Trial A's Burn log and search for the property
         shell: pwsh
         run: |
-          Get-Content customprop-burn.log
           Write-Host "===== grep for CUSTOMPROP in the log ====="
           $found = Select-String -Path customprop-burn.log -Pattern 'CUSTOMPROP'
           if ($found) { $found } else { Write-Host "CUSTOMPROP NEVER APPEARS IN THE LOG AT ALL." }
-          Write-Host "===== grep for the msiexec command line Burn actually built ====="
-          Select-String -Path customprop-burn.log -Pattern 'MsiExec|Setting (MSI )?(string|numeric) (property|variable)|Applying execute package'
 
-      - name: Did the custom property reach the registry, anywhere reachable, after Trial A?
+      - name: Did the custom property reach the registry anywhere, after a FRESH Trial A install?
         shell: pwsh
         run: |
-          $hklmHit = Get-ChildItem 'HKLM:\SOFTWARE' -Recurse -ErrorAction SilentlyContinue 2>$null |
-            Where-Object { $_.Name -match 'ExpApp' } | Select-Object -First 5
-          $hkcuHit = Get-ChildItem 'HKCU:\SOFTWARE' -Recurse -ErrorAction SilentlyContinue 2>$null |
-            Where-Object { $_.Name -match 'ExpApp' } | Select-Object -First 20
-          Write-Host "===== HKCU keys mentioning ExpApp ====="
-          $hkcuHit | ForEach-Object { $_.Name }
-          foreach ($k in $hkcuHit) {
-            try { Get-ItemProperty -LiteralPath $k.PSPath | Format-List } catch {}
+          . .\helpers.ps1
+          $code = Get-ExpAppProductCode
+          Write-Host "Product code: $code"
+          Write-Host "===== ProductInfo well-known fields (native MSI accounting, no custom authoring needed) ====="
+          foreach ($field in 'InstallSource','InstallLocation','RegOwner','RegCompany','HelpLink','ProductName') {
+            Write-Host "$field = $(Get-ExpAppProductInfo $code $field)"
           }
-          Write-Host "===== Any value anywhere under HKCU containing the literal StoreValue? ====="
-          $reg = & reg.exe query 'HKCU\SOFTWARE' /s /f 'StoreValue' 2>&1
-          if ($reg) { $reg } else { Write-Host "reg.exe found no match for StoreValue under HKCU\SOFTWARE" }
+          Write-Host "===== Does StoreValue appear ANYWHERE under this user's registry? (no Permanent=yes, no custom Component authored) ====="
+          $matches = & reg.exe query 'HKCU' /s /f 'StoreValue' 2>&1
+          $lastExit = $LASTEXITCODE
+          if ($lastExit -eq 0) { Write-Host $matches } else { Write-Host "reg.exe found no match for StoreValue anywhere under HKCU (expected: no Registry table exists in this bundle)" }
 
-      - name: Uninstall before Trial B
+      - name: Uninstall before the ARPCOMMENTS trial
         shell: pwsh
-        continue-on-error: true
         run: |
-          $uninst = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -eq 'ExpApp' }
-          if ($uninst) {
-            Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList '/c', $uninst.UninstallString, '/quiet', '/norestart' -Wait
-          }
+          . .\helpers.ps1
+          Remove-ExpApp
 
-      - name: Trial B - reconfirm AGENTS.md's ALLUSERS/MSIINSTALLPERUSER result on THIS build, same method
+      - name: Trial B - ARPCOMMENTS, a RESERVED property MSI writes to the Uninstall registry key natively, no authoring needed
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem out -Filter *.exe | Select-Object -First 1).FullName
+          $p = Start-Process -FilePath $exe -ArgumentList '/quiet','/norestart','ARPCOMMENTS=MicrosoftStoreOrigin','/log',(Join-Path $PWD 'arpcomments-burn.log') -PassThru -Wait
+          Write-Host "Exit code: $($p.ExitCode)"
+          . .\helpers.ps1
+          $code = Get-ExpAppProductCode
+          Write-Host "Product code: $code"
+          $bare = $code.Trim('{','}')
+          $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{$bare}"
+          Write-Host "===== Reading $key ====="
+          Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue | Format-List DisplayName, Comments
+
+      - name: Now simulate OUR OWN updater's silent re-run (SILENT_ARGUMENTS = /quiet /norestart, no property at all) and re-check Comments
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem out -Filter *.exe | Select-Object -First 1).FullName
+          $p = Start-Process -FilePath $exe -ArgumentList '/quiet','/norestart','/log',(Join-Path $PWD 'updater-replay-burn.log') -PassThru -Wait
+          Write-Host "Exit code: $($p.ExitCode)"
+          . .\helpers.ps1
+          $code = Get-ExpAppProductCode
+          $bare = $code.Trim('{','}')
+          $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{$bare}"
+          Write-Host "===== Reading $key after a plain /quiet /norestart re-run (exactly what UpdateInstaller.SILENT_ARGUMENTS does) ====="
+          Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue | Format-List DisplayName, Comments
+          Write-Host "If Comments is now blank, the marker did NOT survive our own updater's plain re-run."
+
+      - name: Uninstall before Trial C
+        shell: pwsh
+        run: |
+          . .\helpers.ps1
+          Remove-ExpApp
+
+      - name: Trial C - reconfirm AGENTS.md's ALLUSERS/MSIINSTALLPERUSER result on THIS build, same method, FRESH install
         shell: pwsh
         run: |
           $exe = (Get-ChildItem out -Filter *.exe | Select-Object -First 1).FullName
           $p = Start-Process -FilePath $exe -ArgumentList '/quiet','/norestart','ALLUSERS=2','MSIINSTALLPERUSER=1','/log',(Join-Path $PWD 'alluserstest-burn.log') -PassThru -Wait
           Write-Host "Exit code: $($p.ExitCode)"
-          $msi = New-Object -ComObject WindowsInstaller.Installer
-          $products = $msi.GetType().InvokeMember('Products', 'GetProperty', $null, $msi, @())
-          foreach ($prod in $products) {
-            $name = $msi.GetType().InvokeMember('ProductInfo', 'GetProperty', $null, $msi, @($prod, 'ProductName'))
-            if ($name -eq 'ExpApp') {
-              $assignment = $msi.GetType().InvokeMember('ProductInfo', 'GetProperty', $null, $msi, @($prod, 'AssignmentType'))
-              Write-Host "ExpApp AssignmentType (0=per-user, 1=per-machine): $assignment"
-            }
-          }
-
-      - name: Read Trial B's Burn log
-        shell: pwsh
-        run: |
-          Get-Content alluserstest-burn.log
-          Write-Host "===== grep for ALLUSERS / MSIINSTALLPERUSER in the log ====="
-          Select-String -Path alluserstest-burn.log -Pattern 'ALLUSERS|MSIINSTALLPERUSER'
+          . .\helpers.ps1
+          $code = Get-ExpAppProductCode
+          $assignment = Get-ExpAppProductInfo $code 'AssignmentType'
+          Write-Host "ExpApp AssignmentType (0=per-user, 1=per-machine) after passing ALLUSERS=2 MSIINSTALLPERUSER=1: $assignment"
+          Write-Host "===== Do ALLUSERS / MSIINSTALLPERUSER show up as live properties in the log, same as CUSTOMPROP did? ====="
+          Select-String -Path alluserstest-burn.log -Pattern 'Property\(S\): (ALLUSERS|MSIINSTALLPERUSER) ='
 
       - name: Final uninstall
         shell: pwsh
         continue-on-error: true
         run: |
-          $uninst = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -eq 'ExpApp' }
-          if ($uninst) {
-            Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList '/c', $uninst.UninstallString, '/quiet', '/norestart' -Wait
-          }
+          . .\helpers.ps1
+          Remove-ExpApp
 
       - name: Upload logs and generated WiX sources as artifacts
         if: always()
