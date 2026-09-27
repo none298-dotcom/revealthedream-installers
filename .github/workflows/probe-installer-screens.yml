@@ -71,15 +71,24 @@ jobs:
           }
           $p = Start-Process -FilePath $exe -PassThru
           $ws = New-Object -ComObject WScript.Shell
-          for ($i = 1; $i -le 8; $i++) {
-            Start-Sleep -Seconds 7
-            Snap ("{0:D2}" -f $i)
-            if ($p.HasExited) { Write-Host "installer exited after step $i"; break }
-            $ws.SendKeys('{ENTER}') | Out-Null
+          # A photo every second for the first 20 seconds, pressing Enter every 7, so a screen that
+          # is up for only a moment is still caught.
+          for ($t = 1; $t -le 40; $t++) {
+            Start-Sleep -Seconds 1
+            Snap ("t{0:D2}" -f $t)
+            if (($t % 7) -eq 0 -and -not $p.HasExited) { $ws.SendKeys('{ENTER}') | Out-Null }
           }
-          Start-Sleep -Seconds 5
+          Start-Sleep -Seconds 10
           Snap "99-final"
-          Get-Process | Where-Object { $_.ProcessName -match 'msiexec|Reveal' } | ForEach-Object { Write-Host "still running: $($_.ProcessName)" }
+          # Did it install, and in which scope (0 = per-user, 1 = per-machine)?
+          $dir = "$env:LOCALAPPDATA\Reveal the Dream"
+          Write-Host "install folder present: $(Test-Path $dir)"
+          if (Test-Path $dir) { Write-Host "exe present: $(Test-Path "$dir\Reveal the Dream.exe")" }
+          $msi = New-Object -ComObject WindowsInstaller.Installer
+          foreach ($code in $msi.Products) {
+            $name = $msi.ProductInfo($code, "ProductName")
+            if ($name -match "Reveal") { Write-Host "installed: $name $($msi.ProductInfo($code, 'VersionString')) AssignmentType=$($msi.ProductInfo($code, 'AssignmentType'))" }
+          }
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
