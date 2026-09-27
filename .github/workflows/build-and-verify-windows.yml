@@ -43,6 +43,13 @@ on:
         description: "Shoot Microsoft Store screenshots and run the click test"
         type: boolean
         default: true
+      # Space separated app language ids (de es es-MX fr it ja ko pt-BR zh-Hans hi he th vi). Each is
+      # shot BEFORE English, into its own folder, so the English seed the click test relies on is the
+      # last one written. Blank shoots English only, exactly as before.
+      screenshot_languages:
+        description: "Also shoot the store screenshots in these languages (space separated ids)"
+        type: string
+        default: ""
       # VERIFY WHAT MICROSOFT WILL ACTUALLY DOWNLOAD, rather than a sibling build of the same
       # source. Added 2026-08-06: the binary behind the submission's package URL turned out not to
       # be the one any gate had ever run against. Two builds of identical source differ in bytes
@@ -1205,7 +1212,16 @@ jobs:
       - name: Shoot Microsoft Store screenshots
         if: ${{ inputs.screenshots }}
         shell: pwsh
+        env:
+          SCREENSHOT_LANGUAGES: ${{ inputs.screenshot_languages }}
         run: |
+          foreach ($lang in ($env:SCREENSHOT_LANGUAGES -split '\s+' | Where-Object { $_ -and $_ -ne 'en' })) {
+            ./tools/windows-store-screenshots.ps1 `
+              -InstalledExe "${{ steps.installed.outputs.exe }}" `
+              -RepoRoot "${{ github.workspace }}" `
+              -OutputDir "$env:RUNNER_TEMP\store-screenshots-i18n\$lang" `
+              -Language $lang
+          }
           ./tools/windows-store-screenshots.ps1 `
             -InstalledExe "${{ steps.installed.outputs.exe }}" `
             -RepoRoot "${{ github.workspace }}" `
@@ -1217,6 +1233,14 @@ jobs:
         with:
           name: microsoft-store-screenshots
           path: ${{ runner.temp }}/store-screenshots/*.png
+          if-no-files-found: error
+
+      - name: Upload the store screenshots in other languages
+        if: ${{ inputs.screenshots && inputs.screenshot_languages != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: microsoft-store-screenshots-i18n
+          path: ${{ runner.temp }}/store-screenshots-i18n/
           if-no-files-found: error
 
       # Presses a button. Everything above this asserts the app is signed, installed correctly and
