@@ -1,0 +1,88 @@
+name: Probe the installer's setup screens
+
+# WHAT A PERSON SEES INSTALLING FROM THE WEBSITE. The Microsoft Store installs with /quiet and the
+# in-app updater runs /quiet, so neither shows a dialog; only a first install from
+# revealthedream.com shows the setup wizard, and jpackage builds that wizard in ONE language
+# (English), whatever the PC's language. This job photographs every screen of two builds, both made
+# here and thrown away: the installer exactly as configured, and one with the folder-choice step
+# removed (`--win-dir-chooser` / `dirChooser`), to measure whether that leaves only Windows' own
+# progress window, which Windows draws in the PC's language. Nothing is signed, uploaded to a
+# release, or committed anywhere; the screenshots are the only output.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Private repo ref to build"
+        default: "main"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [as-shipped, no-folder-step]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/revealthedream
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Remove the folder step (variant only, on this runner only)
+        if: ${{ matrix.variant == 'no-folder-step' }}
+        shell: pwsh
+        run: |
+          $f = "android/desktop/build.gradle.kts"
+          $t = Get-Content $f -Raw
+          $t = $t -replace '\s*"--win-dir-chooser",', ''
+          $t = $t -replace 'dirChooser = true', 'dirChooser = false'
+          Set-Content $f $t -NoNewline
+          if (Select-String -Path $f -Pattern '"--win-dir-chooser"' -Quiet) { Write-Error "flag still present"; exit 1 }
+
+      - name: Build the installer
+        working-directory: android
+        run: ./gradlew :desktop:packageExe --console=plain --no-daemon
+
+      - name: Run it with its normal screens and photograph each one
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $exe = @(Get-ChildItem -Recurse -Filter *.exe -Path android/desktop/build/compose/binaries/main/exe)[0].FullName
+          $out = "$env:RUNNER_TEMP\shots"; New-Item -ItemType Directory -Force -Path $out | Out-Null
+          function Snap($name) {
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save("$out\$name.png") | Out-Null
+            $g.Dispose(); $bmp.Dispose()
+          }
+          $p = Start-Process -FilePath $exe -PassThru
+          $ws = New-Object -ComObject WScript.Shell
+          for ($i = 1; $i -le 8; $i++) {
+            Start-Sleep -Seconds 7
+            Snap ("{0:D2}" -f $i)
+            if ($p.HasExited) { Write-Host "installer exited after step $i"; break }
+            $ws.SendKeys('{ENTER}') | Out-Null
+          }
+          Start-Sleep -Seconds 5
+          Snap "99-final"
+          Get-Process | Where-Object { $_.ProcessName -match 'msiexec|Reveal' } | ForEach-Object { Write-Host "still running: $($_.ProcessName)" }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: setup-screens-${{ matrix.variant }}
+          path: ${{ runner.temp }}/shots
+          retention-days: 7
