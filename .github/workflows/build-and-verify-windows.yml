@@ -1421,6 +1421,18 @@ jobs:
           $manifest.winVersion = $version
           $manifest.buildEpoch = [int][double]::Parse((Get-Date -UFormat %s))
 
+          # THE NOTES THE UPDATE WINDOW SHOWS, in every language the app speaks. Nothing wrote
+          # winNotes before 1.7.5, so every customer saw the generic line. They come from the one
+          # place release notes live (design/store/store-copy.json, Microsoft entry for this
+          # version) and the app picks its own language, falling back to English.
+          $storeCopy = Get-Content design/store/store-copy.json -Raw -Encoding utf8 | ConvertFrom-Json
+          $notesEntry = $storeCopy.microsoft.releaseNotes.$version
+          if (-not $notesEntry -or -not $notesEntry.text) { Write-Error "store-copy.json has no Microsoft release notes for $version."; exit 1 }
+          $notesByLanguage = [ordered]@{}
+          if ($notesEntry.locales) { foreach ($p in $notesEntry.locales.PSObject.Properties) { $notesByLanguage[$p.Name] = $p.Value } }
+          $manifest | Add-Member -NotePropertyName winNotes -NotePropertyValue $notesEntry.text -Force
+          $manifest | Add-Member -NotePropertyName winNotesByLanguage -NotePropertyValue $notesByLanguage -Force
+
           # WRITE IT BACK TO DISK. `gh release upload` sends the FILE, and every line above only
           # mutated an in-memory object. Without this the freshly downloaded, unmodified latest.json
           # is what gets uploaded.
@@ -1450,6 +1462,7 @@ jobs:
           }
           if ($onDisk.winUrl -notlike "*$($asset.name)") { Write-Error "winUrl does not end in the asset name"; exit 1 }
           if ($onDisk.winSha256 -ne $sha) { Write-Error "Manifest on disk has the wrong winSha256. The write-back did not happen."; exit 1 }
+          if (-not $onDisk.winNotes) { Write-Error "Manifest on disk has no winNotes. The write-back did not happen."; exit 1 }
           if ($onDisk.winSha256 -notmatch '^[0-9a-f]{64}$') { Write-Error "winSha256 is not 64 hex characters: $($onDisk.winSha256)"; exit 1 }
           foreach ($k in $macBefore.Keys) {
             if ("$($onDisk.$k)" -ne "$($macBefore[$k])") { Write-Error "Manifest on disk changed $k from '$($macBefore[$k])' to '$($onDisk.$k)'. This step must never touch Mac keys."; exit 1 }
