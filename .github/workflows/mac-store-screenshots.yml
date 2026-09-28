@@ -21,6 +21,10 @@ on:
         description: "stage.py scenarios, space separated"
         type: string
         default: "site-steps progress site-run site-noalcohol complete"
+      late_shot:
+        description: "Also capture each window this many seconds later (0 = off), to catch anything still animating"
+        type: string
+        default: "0"
 
 permissions:
   contents: read
@@ -86,6 +90,7 @@ jobs:
         env:
           LANGS: ${{ inputs.languages }}
           SCENARIOS: ${{ inputs.scenarios }}
+          LATE_SHOT: ${{ inputs.late_shot }}
         run: |
           set -euo pipefail
           APP="/Applications/Reveal the Dream.app"
@@ -136,6 +141,7 @@ jobs:
               echo "window: $(./wins | tr '\n' ';')"
               screencapture -x "$OUT/$L/$S-screen.png"
               if [ -n "$WIN" ]; then screencapture -x -o -l "$WIN" "$OUT/$L/$S.png"; fi
+              if [ "${LATE_SHOT:-0}" != "0" ] && [ -n "$WIN" ]; then sleep "$LATE_SHOT"; screencapture -x -o -l "$WIN" "$OUT/$L/$S-late.png"; fi
             done
           done
           pkill -x "Reveal the Dream" || true
