@@ -110,6 +110,10 @@ jobs:
             LOCALE=$(echo "$L" | tr '-' '_')
             for S in $SCENARIOS; do
               pkill -x "Reveal the Dream" || true; sleep 2
+              # Today's check-in opened two minutes ago: today's petal carries a shimmer band that
+              # crosses it as the window runs, and on the wide Mac canvas it reads as a stray wedge
+              # hours in. The iPhone set is staged the same way in effect.
+              export RTD_CHECK_IN_TIME=$(date -v-2M +%H:%M)
               python3 - "$GROUP" "$L" "$S" <<'PY'
           import json, pathlib, shutil, sys
           sys.path.insert(0, "src/tools/store-shots")
@@ -127,7 +131,7 @@ jobs:
               sleep 12
               osascript -e 'tell application "System Events" to tell process "Reveal the Dream" to set position of front window to {0, 25}' \
                         -e 'tell application "System Events" to tell process "Reveal the Dream" to set size of front window to {1440, 900}' 2>&1 || true
-              sleep 3
+              sleep 8
               WIN=$(./wins | awk '$2==0{print $1; exit}')
               echo "window: $(./wins | tr '\n' ';')"
               screencapture -x "$OUT/$L/$S-screen.png"
