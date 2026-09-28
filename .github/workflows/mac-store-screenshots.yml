@@ -21,6 +21,10 @@ on:
         description: "stage.py scenarios, space separated"
         type: string
         default: "site-steps progress site-run site-noalcohol complete"
+      keep_utc:
+        description: "Leave the runner on UTC (diagnostic)"
+        type: string
+        default: "0"
       late_shot:
         description: "Also capture each window this many seconds later (0 = off), to catch anything still animating"
         type: string
@@ -72,11 +76,13 @@ jobs:
           displayplacer list | grep -E "Resolution|Scaling|current mode" | head -5 || true
 
       - name: A Retina screen for 2880x1800 (falls back to the 1x screen above)
+        env:
+          KEEP_UTC: ${{ inputs.keep_utc }}
         run: |
           # The staged journeys are in Asia/Seoul, and stage.py opens today's check-in an hour before
           # the machine's own clock, so the machine runs on Seoul time like the iPhone captures. A
           # hidden Dock gives the window the full 900 points.
-          sudo systemsetup -settimezone Asia/Seoul >/dev/null 2>&1 || sudo ln -sf /usr/share/zoneinfo/Asia/Seoul /etc/localtime
+          if [ "${KEEP_UTC:-0}" = "0" ]; then sudo systemsetup -settimezone Asia/Seoul >/dev/null 2>&1 || sudo ln -sf /usr/share/zoneinfo/Asia/Seoul /etc/localtime; fi
           date
           defaults write com.apple.dock autohide -bool true && killall Dock || true
           cd src/tools/store-shots/mac-vdisp
@@ -118,7 +124,7 @@ jobs:
               # Today's check-in opened two minutes ago: today's petal carries a shimmer band that
               # crosses it as the window runs, and on the wide Mac canvas it reads as a stray wedge
               # hours in. The iPhone set is staged the same way in effect.
-              export RTD_CHECK_IN_TIME=$(date -v-2M +%H:%M)
+              export RTD_CHECK_IN_TIME=$(TZ=Asia/Seoul date -v-2M +%H:%M)
               python3 - "$GROUP" "$L" "$S" <<'PY'
           import json, pathlib, shutil, sys
           sys.path.insert(0, "src/tools/store-shots")
