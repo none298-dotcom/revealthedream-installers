@@ -25,13 +25,18 @@ on:
         description: "Leave the runner on UTC (diagnostic)"
         type: string
         default: "0"
+      candidate:
+        description: "Diagnostic only: tag of a DRAFT release in this repo whose candidate.zip replaces the live app (never published)"
+        type: string
+        default: ""
       late_shot:
         description: "Also capture each window this many seconds later (0 = off), to catch anything still animating"
         type: string
         default: "0"
 
 permissions:
-  contents: read
+  # write only so a DRAFT release (a test build, never public) can be read; nothing here writes.
+  contents: write
 
 jobs:
   shoot:
@@ -52,6 +57,9 @@ jobs:
           path: src
 
       - name: Install the notarized DMG customers download
+        env:
+          CANDIDATE: ${{ inputs.candidate }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           curl -sSL -o rtd.dmg https://revealthedream.com/download/mac
@@ -60,6 +68,15 @@ jobs:
           hdiutil detach "$MNT" -quiet
           spctl -a -vv -t exec "/Applications/Reveal the Dream.app" 2>&1 | tee spctl.txt
           grep -q "Notarized Developer ID" spctl.txt
+          if [ -n "${CANDIDATE}" ]; then
+            # A test build for a diagnosis, signed Developer ID and not notarized. It is fetched
+            # with gh, so it carries no quarantine flag and Gatekeeper never assesses it.
+            gh release download "$CANDIDATE" -R "$GITHUB_REPOSITORY" -p candidate.zip -D cand
+            rm -rf "/Applications/Reveal the Dream.app"
+            ditto -x -k cand/candidate.zip /Applications/
+            codesign -dvv "/Applications/Reveal the Dream.app" 2>&1 | grep -E "Authority=Developer ID|TeamIdentifier"
+            echo "CANDIDATE $CANDIDATE installed"
+          fi
           /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "/Applications/Reveal the Dream.app/Contents/Info.plist"
 
       - name: Describe the machine, and give it a screen big enough for 1440x900
