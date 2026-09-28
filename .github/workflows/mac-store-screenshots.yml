@@ -54,10 +54,18 @@ jobs:
           grep -q "Notarized Developer ID" spctl.txt
           /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "/Applications/Reveal the Dream.app/Contents/Info.plist"
 
-      - name: Describe the machine
+      - name: Describe the machine, and give it a screen big enough for 1440x900
         run: |
-          system_profiler SPDisplaysDataType | grep -E "Resolution|Retina|UI Looks like" || true
           sw_vers
+          brew install displayplacer >/dev/null 2>&1 || true
+          displayplacer list | tee displays.txt | head -60 || true
+          # The screen the store sizes need: 1440x900 points, at 2x (2880x1800) when offered.
+          ID=$(awk '/Persistent screen id:/{print $4; exit}' displays.txt)
+          for mode in "res:1440x900 hz:60 color_depth:8 scaling:on" "res:1440x900 scaling:on" "res:2880x1800" "res:1440x900" "res:1680x1050" "res:1920x1080"; do
+            if displayplacer "id:$ID $mode" 2>&1 | tee -a set.txt | grep -qi "error\|unable\|could not"; then continue; fi
+            echo "set: $mode"; break
+          done
+          displayplacer list | grep -E "Resolution|Scaling|current mode" | head -5 || true
 
       - name: Shoot
         env:
@@ -101,7 +109,10 @@ jobs:
           print(lang, scenario, summary)
           PY
               open -n "$APP" --args -AppleLanguages "($L)" -AppleLocale "$LOCALE"
-              sleep 15
+              sleep 12
+              osascript -e 'tell application "System Events" to tell process "Reveal the Dream" to set position of front window to {0, 25}' \
+                        -e 'tell application "System Events" to tell process "Reveal the Dream" to set size of front window to {1440, 875}' 2>&1 || true
+              sleep 3
               WIN=$(./wins | awk '$2==0{print $1; exit}')
               echo "window: $(./wins | tr '\n' ';')"
               screencapture -x "$OUT/$L/$S-screen.png"
