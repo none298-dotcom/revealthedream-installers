@@ -69,6 +69,12 @@ jobs:
 
       - name: A Retina screen for 2880x1800 (falls back to the 1x screen above)
         run: |
+          # The staged journeys are in Asia/Seoul, and stage.py opens today's check-in an hour before
+          # the machine's own clock, so the machine runs on Seoul time like the iPhone captures. A
+          # hidden Dock gives the window the full 900 points.
+          sudo systemsetup -settimezone Asia/Seoul >/dev/null 2>&1 || sudo ln -sf /usr/share/zoneinfo/Asia/Seoul /etc/localtime
+          date
+          defaults write com.apple.dock autohide -bool true && killall Dock || true
           cd src/tools/store-shots/mac-vdisp
           swiftc -O -import-objc-header VirtualDisplay.h vdisp.swift -o "$RUNNER_TEMP/vdisp"
           nohup "$RUNNER_TEMP/vdisp" > "$RUNNER_TEMP/vdisp.log" 2>&1 &
