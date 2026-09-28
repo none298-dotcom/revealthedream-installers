@@ -67,6 +67,15 @@ jobs:
           done
           displayplacer list | grep -E "Resolution|Scaling|current mode" | head -5 || true
 
+      - name: A Retina screen for 2880x1800 (falls back to the 1x screen above)
+        run: |
+          cd src/tools/store-shots/mac-vdisp
+          swiftc -O -import-objc-header VirtualDisplay.h vdisp.swift -o "$RUNNER_TEMP/vdisp"
+          nohup "$RUNNER_TEMP/vdisp" > "$RUNNER_TEMP/vdisp.log" 2>&1 &
+          sleep 6
+          cat "$RUNNER_TEMP/vdisp.log"
+          displayplacer list | grep -E "Resolution|Scaling|Origin|Main Display|Type" | head -12 || true
+
       - name: Shoot
         env:
           LANGS: ${{ inputs.languages }}
@@ -111,7 +120,7 @@ jobs:
               open -n "$APP" --args -AppleLanguages "($L)" -AppleLocale "$LOCALE"
               sleep 12
               osascript -e 'tell application "System Events" to tell process "Reveal the Dream" to set position of front window to {0, 25}' \
-                        -e 'tell application "System Events" to tell process "Reveal the Dream" to set size of front window to {1440, 875}' 2>&1 || true
+                        -e 'tell application "System Events" to tell process "Reveal the Dream" to set size of front window to {1440, 900}' 2>&1 || true
               sleep 3
               WIN=$(./wins | awk '$2==0{print $1; exit}')
               echo "window: $(./wins | tr '\n' ';')"
