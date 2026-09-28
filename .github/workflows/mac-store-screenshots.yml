@@ -1,0 +1,119 @@
+name: Mac App Store screenshots
+
+# The Mac App Store screenshots in every language, shot on a GitHub Mac with a fresh user, so the
+# owner's own Mac and its real journeys are never touched (AGENTS.md: launch no locally built Mac
+# app on the owner's Mac). It runs the NOTARIZED DMG customers download, which is allowed to run
+# anywhere, stages each journey the way tools/store-shots/stage.py does for the iPhone, and
+# photographs the window. The reveal screen is the same code in the DMG and the App Store build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit of the private repo for the staging script, captions and photos"
+        required: true
+        type: string
+      languages:
+        description: "App language ids, space separated"
+        type: string
+        default: "en"
+      scenarios:
+        description: "stage.py scenarios, space separated"
+        type: string
+        default: "site-steps progress site-run site-noalcohol complete"
+
+permissions:
+  contents: read
+
+jobs:
+  shoot:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Check out the staging script, captions and photos
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/revealthedream
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+          sparse-checkout: |
+            tools/store-shots
+            design/store/screenshot-captions.json
+            android/store/photos
+          path: src
+
+      - name: Install the notarized DMG customers download
+        run: |
+          set -euo pipefail
+          curl -sSL -o rtd.dmg https://revealthedream.com/download/mac
+          MNT=$(hdiutil attach -nobrowse -readonly rtd.dmg | awk -F'\t' '/Volumes/{print $NF}')
+          ditto "$MNT/Reveal the Dream.app" "/Applications/Reveal the Dream.app"
+          hdiutil detach "$MNT" -quiet
+          spctl -a -vv -t exec "/Applications/Reveal the Dream.app" 2>&1 | tee spctl.txt
+          grep -q "Notarized Developer ID" spctl.txt
+          /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "/Applications/Reveal the Dream.app/Contents/Info.plist"
+
+      - name: Describe the machine
+        run: |
+          system_profiler SPDisplaysDataType | grep -E "Resolution|Retina|UI Looks like" || true
+          sw_vers
+
+      - name: Shoot
+        env:
+          LANGS: ${{ inputs.languages }}
+          SCENARIOS: ${{ inputs.scenarios }}
+        run: |
+          set -euo pipefail
+          APP="/Applications/Reveal the Dream.app"
+          OUT="$RUNNER_TEMP/mac-shots"; mkdir -p "$OUT"
+          cat > wins.swift <<'SWIFT'
+          import CoreGraphics
+          let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+          for w in list where (w[kCGWindowOwnerName as String] as? String) == "Reveal the Dream" {
+            let b = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
+            print(w[kCGWindowNumber as String] ?? 0, w[kCGWindowLayer as String] ?? 0, b["Width"] ?? 0, b["Height"] ?? 0)
+          }
+          SWIFT
+          swiftc -O wins.swift -o wins
+          # First launch creates the app group container.
+          open "$APP"; sleep 20; ./wins || true
+          pkill -x "Reveal the Dream" || true; sleep 3
+          GROUP="$HOME/Library/Group Containers/ZX4XWHUB9W.group.com.revealthedream.shared/RevealShared"
+          ls -la "$HOME/Library/Group Containers" | grep -i reveal || true
+          mkdir -p "$GROUP"
+          for L in $LANGS; do
+            mkdir -p "$OUT/$L"
+            LOCALE=$(echo "$L" | tr '-' '_')
+            for S in $SCENARIOS; do
+              pkill -x "Reveal the Dream" || true; sleep 2
+              python3 - "$GROUP" "$L" "$S" <<'PY'
+          import json, pathlib, shutil, sys
+          sys.path.insert(0, "src/tools/store-shots")
+          import stage
+          group, lang, scenario = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+          for f in group.iterdir():
+              if f.is_file():
+                  f.unlink()
+          envelope, image, photo, summary = stage.build(lang, scenario, premium_source="server")
+          (group / "app-state-v1.json").write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
+          shutil.copy(photo, group / image)
+          print(lang, scenario, summary)
+          PY
+              open -n "$APP" --args -AppleLanguages "($L)" -AppleLocale "$LOCALE"
+              sleep 15
+              WIN=$(./wins | awk '$2==0{print $1; exit}')
+              echo "window: $(./wins | tr '\n' ';')"
+              screencapture -x "$OUT/$L/$S-screen.png"
+              if [ -n "$WIN" ]; then screencapture -x -o -l "$WIN" "$OUT/$L/$S.png"; fi
+            done
+          done
+          pkill -x "Reveal the Dream" || true
+          ls -R "$OUT" | head -40
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mac-store-screenshots
+          path: ${{ runner.temp }}/mac-shots
