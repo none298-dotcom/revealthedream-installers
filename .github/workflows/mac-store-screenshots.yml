@@ -142,6 +142,10 @@ jobs:
               screencapture -x "$OUT/$L/$S-screen.png"
               if [ -n "$WIN" ]; then screencapture -x -o -l "$WIN" "$OUT/$L/$S.png"; fi
               if [ "${LATE_SHOT:-0}" != "0" ] && [ -n "$WIN" ]; then sleep "$LATE_SHOT"; screencapture -x -o -l "$WIN" "$OUT/$L/$S-late.png"; fi
+              if [ "${LATE_SHOT:-0}" != "0" ]; then
+                osascript -e 'tell application "System Events" to tell process "Reveal the Dream" to get {role, description, value, name} of every UI element of entire contents of front window' > "$OUT/$L/$S-ax.txt" 2>&1 || true
+                head -c 3000 "$OUT/$L/$S-ax.txt"; echo
+              fi
             done
           done
           pkill -x "Reveal the Dream" || true
