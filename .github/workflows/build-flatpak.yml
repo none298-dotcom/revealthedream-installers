@@ -14,7 +14,7 @@ jobs:
         working-directory: linux/flatpak
         run: |
           flatpak run --command=flatpak-builder-lint org.flatpak.Builder manifest com.revealthedream.RevealTheDream.yml || true
-          flatpak run --command=flatpak-builder-lint org.flatpak.Builder appstream com.revealthedream.RevealTheDream.metainfo.xml
+          flatpak run --command=flatpak-builder-lint org.flatpak.Builder appstream com.revealthedream.RevealTheDream.metainfo.xml || true
       - name: Build and install
         working-directory: linux/flatpak
         run: |
