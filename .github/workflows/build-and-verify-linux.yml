@@ -190,6 +190,10 @@ jobs:
             pid=$!
             sleep 40
             kill -0 $pid
+            import -window root shots/session-before.png
+            for w in $(xdotool search --name "Reveal" 2>/dev/null); do
+              echo "$w $(xwininfo -id $w | grep -E "Absolute|Width|Height|Map State" | paste -sd" " -) $(xprop -id $w WM_NAME _NET_WM_STATE 2>/dev/null | paste -sd" " -)"
+            done | tee shots/windows-all.txt
             # An ordinary window opened over the mini window, which must stay on top.
             xterm -geometry 200x60+0+0 -bg "#552222" & sleep 3
             for w in $(xdotool search --onlyvisible --name "." 2>/dev/null); do
@@ -237,6 +241,7 @@ jobs:
           import -window root shots/after-update.png
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always() && steps.pack.outcome == 'success'
         with:
           name: revealthedream-linux-${{ steps.pack.outputs.version }}
           path: dist/
