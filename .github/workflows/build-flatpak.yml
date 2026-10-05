@@ -18,12 +18,12 @@ jobs:
       - name: Build and install
         working-directory: linux/flatpak
         run: |
-          flatpak run org.flatpak.Builder --user --install-deps-from=flathub --install --force-clean --repo=repo build com.revealthedream.RevealTheDream.yml
+          dbus-run-session flatpak-builder --user --install-deps-from=flathub --install --force-clean --repo=repo build com.revealthedream.RevealTheDream.yml
           flatpak run --command=flatpak-builder-lint org.flatpak.Builder repo repo || true
       - name: Run and photograph it
         run: |
           Xvfb :99 -screen 0 1440x900x24 & sleep 2
-          (DISPLAY=:99 flatpak run com.revealthedream.RevealTheDream > run.log 2>&1 &); sleep 45
+          (DISPLAY=:99 dbus-run-session flatpak run com.revealthedream.RevealTheDream > run.log 2>&1 &); sleep 45
           DISPLAY=:99 import -window root flatpak-first-launch.png
           tail -20 run.log
           pgrep -f reveal-the-dream >/dev/null
