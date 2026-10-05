@@ -9,7 +9,7 @@
   <description>
     <p>Pick a photo of a goal you are working toward. It starts covered, divided into one piece per day of your journey. Each daily check-in uncovers one more piece, until the whole photo shows.</p>
     <p>Miss a day and nothing resets. That day's piece stays covered and the next days keep opening.</p>
-    <p>On Linux you get a mini window that stays above your other windows and a daily reminder in your desktop's notifications. Free to use. Premium adds sync with iPhone, Mac, Windows and Android, several journeys at once, rest days and App Lock.</p>
+    <p>On Linux you get a mini window that stays above your other windows and a daily reminder in your desktop's notifications. Free to use. Premium adds sync across all your devices and platforms, several journeys at once, rest days and App Lock.</p>
   </description>
   <launchable type="desktop-id">com.revealthedream.RevealTheDream.desktop</launchable>
   <url type="homepage">https://revealthedream.com/habit-tracker-for-linux</url>
