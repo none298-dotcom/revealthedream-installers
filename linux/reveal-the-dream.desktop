@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Reveal the Dream
+GenericName=Goal tracker
+Comment=Uncover a photo of your goal, one daily check-in at a time
+Exec=reveal-the-dream
+Icon=reveal-the-dream
+Terminal=false
+Categories=Utility;
+Keywords=goal;habit;streak;photo;journey;

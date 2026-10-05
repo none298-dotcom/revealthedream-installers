@@ -1,0 +1,143 @@
+name: Build and verify the Linux AppImage
+
+# Linux (owner, 2026-10-05): the same format as the owner's other apps. The Compose Desktop app the
+# EXE is built from, packed into one RevealTheDream-<version>-x86_64.AppImage with appimagetool,
+# the way keepthediff-installers does it. The app updates itself: the release Mac signs each
+# AppImage's SHA-256 with an Ed25519 key kept on that Mac only, and the manifest carries the
+# signature (android/desktop/.../update/LinuxAppImageUpdate.kt). Nothing is signed here.
+#
+# Built on Ubuntu 22.04 on purpose: an AppImage runs on systems at least as new as the one it was
+# built on, so the oldest runner reaches the most people.
+#
+# Then the AppImage is RUN on a virtual screen and photographed. "It built" is not "it works".
+# This workflow never publishes. Publishing waits for the owner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Private repo branch, tag or SHA to build"
+        default: "main"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-22.04
+    env:
+      APPIMAGETOOL_URL: https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+      APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+    steps:
+      - name: Check out the PRIVATE source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/revealthedream
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - name: Check out this repo's own files
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: ci
+          persist-credentials: false
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Tools for packing and for the virtual screen
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb imagemagick desktop-file-utils libnotify-bin
+          curl -sSL -o appimagetool "$APPIMAGETOOL_URL"
+          echo "$APPIMAGETOOL_SHA256  appimagetool" | sha256sum -c -
+          chmod +x appimagetool
+
+      - name: Desktop tests
+        working-directory: android
+        run: ./gradlew :desktop:test --no-daemon -q
+
+      - name: Build the app folder
+        working-directory: android
+        run: ./gradlew :desktop:createDistributable --no-daemon
+
+      - name: Pack the AppImage
+        id: pack
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 'val desktopPackageVersion = ' android/desktop/build.gradle.kts | sed 's/.*"\(.*\)".*/\1/')
+          # createDistributable names the folder and launcher after the shared packageName,
+          # "Reveal the Dream". The launcher, its .cfg (which jpackage finds by the launcher's own
+          # name) and the icon are renamed together, so nothing on Linux has a space in its path.
+          built="android/desktop/build/compose/binaries/main/app/Reveal the Dream"
+          app=android/desktop/build/compose/binaries/main/app/reveal-the-dream
+          rm -rf "$app" && cp -a "$built" "$app"
+          mv "$app/bin/Reveal the Dream" "$app/bin/reveal-the-dream"
+          mv "$app/lib/app/Reveal the Dream.cfg" "$app/lib/app/reveal-the-dream.cfg"
+          if [ -f "$app/lib/Reveal the Dream.png" ]; then mv "$app/lib/Reveal the Dream.png" "$app/lib/reveal-the-dream.png"; fi
+          test -x "$app/bin/reveal-the-dream"
+
+          appdir=RevealTheDream.AppDir
+          mkdir -p "$appdir/usr" dist
+          cp -a "$app/." "$appdir/usr/"
+          cp ci/linux/AppRun "$appdir/AppRun"
+          chmod +x "$appdir/AppRun"
+          cp ci/linux/reveal-the-dream.desktop "$appdir/reveal-the-dream.desktop"
+          desktop-file-validate "$appdir/reveal-the-dream.desktop"
+          cp android/desktop/icons/reveal-the-dream.png "$appdir/reveal-the-dream.png"
+          out="dist/RevealTheDream-$version-x86_64.AppImage"
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool --no-appstream "$appdir" "$out"
+          chmod +x "$out"
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          ls -l dist
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "appimage=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Run it on a virtual screen and photograph it
+        env:
+          APPIMAGE_FILE: ${{ steps.pack.outputs.appimage }}
+        run: |
+          set -euo pipefail
+          mkdir -p shots
+          shoot() {  # name, data dir, extra args...
+            local name=$1 data=$2; shift 2
+            REVEAL_DESKTOP_DATA_DIR="$data" xvfb-run -a -s "-screen 0 1600x1000x24" bash -c '
+              APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGE_FILE" "$@" > "shots/'"$name"'.log" 2>&1 &
+              pid=$!
+              sleep 30
+              kill -0 $pid || { echo "the app quit on '"$name"'"; cat "shots/'"$name"'.log"; exit 1; }
+              import -window root "shots/'"$name"'.png"
+              kill $pid' _ "$@"
+          }
+
+          # 1. A first launch on an empty machine: the tour.
+          shoot first-launch "$PWD/data-fresh"
+
+          # 2. A seeded 30 day journey, from the same seeder and photo the Windows store shots use.
+          seed="$PWD/data-seeded"
+          printf '%s\n' "$PWD/site/assets/demo/steps-4-5.jpg" "Get 10,000 steps a day" 30 12 4 petals sage > seed-args.txt
+          (cd android && REVEAL_DESKTOP_DATA_DIR="$seed" xvfb-run -a ./gradlew :desktop:run --no-daemon --console=plain -q \
+            "--args=--verify seed-store @$PWD/../seed-args.txt" 2>&1 | tee ../shots/seed.log | grep VERIFY_)
+          grep -q 'VERIFY_SEED_STORE:.*canCheckIn=true' shots/seed.log
+          shoot reveal "$seed"
+          shoot settings "$seed" --open settings
+          shoot journeys "$seed" --open journeys
+
+          # The data the app wrote must be owner-only, as on the other platforms.
+          stat -c '%a %n' "$seed" "$seed"/* | tee shots/permissions.txt
+          ls -l shots
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: revealthedream-linux-${{ steps.pack.outputs.version }}
+          path: dist/
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: revealthedream-linux-shots
+          path: shots/
