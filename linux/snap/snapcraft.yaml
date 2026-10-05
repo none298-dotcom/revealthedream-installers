@@ -25,6 +25,8 @@ apps:
     command: usr/bin/reveal-the-dream
     desktop: snap/gui/reveal-the-dream.desktop
     extensions: [gnome]
+    environment:
+      JAVA_TOOL_OPTIONS: -Duser.home=$SNAP_USER_DATA
     plugs: [network, home, desktop, desktop-legacy, x11, wayland, unity7, opengl]
 
 parts:
