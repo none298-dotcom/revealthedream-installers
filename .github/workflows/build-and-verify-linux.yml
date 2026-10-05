@@ -19,9 +19,16 @@ on:
         description: "Private repo branch, tag or SHA to build"
         default: "main"
         required: true
+      update_run:
+        description: "Optional: a run id whose AppImage the update check installs over this build"
+        default: ""
+      update_sig:
+        description: "Optional: linuxSig for that AppImage, made on the release Mac"
+        default: ""
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   build-and-verify:
@@ -52,7 +59,7 @@ jobs:
       - name: Tools for packing and for the virtual screen
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xvfb imagemagick desktop-file-utils libnotify-bin
+          sudo apt-get install -y -qq xvfb imagemagick desktop-file-utils libnotify-bin openbox stalonetray dunst xdotool x11-utils xterm dbus-x11
           curl -sSL -o appimagetool "$APPIMAGETOOL_URL"
           echo "$APPIMAGETOOL_SHA256  appimagetool" | sha256sum -c -
           chmod +x appimagetool
@@ -129,6 +136,8 @@ jobs:
           (cd android && REVEAL_DESKTOP_DATA_DIR="$seed" xvfb-run -a ./gradlew :desktop:run --no-daemon --console=plain -q \
             "--args=--verify seed-store @$PWD/../seed-args.txt" 2>&1 | tee ../shots/seed.log | grep VERIFY_)
           grep -q 'VERIFY_SEED_STORE:.*canCheckIn=true' shots/seed.log
+          # What's New marked seen, so the reveal shot shows the check-in button it would cover.
+          printf '%s' "$(basename "$APPIMAGE_FILE" | sed 's/RevealTheDream-\(.*\)-x86_64.AppImage/\1/')" > "$seed/whats-new-last-seen"
           shoot reveal "$seed"
           shoot settings "$seed" --open settings
           shoot journeys "$seed" --open journeys
@@ -142,10 +151,90 @@ jobs:
           mkdir -p shots/renders
           find android/desktop/screenshot -name '*.png' -newer seed-args.txt -exec cp {} shots/renders/ \; || true
           ls shots/renders
+          test -f shots/renders/premium-full-list.png
 
           # The data the app wrote must be owner-only, as on the other platforms.
           stat -c '%a %n' "$seed" "$seed"/* | tee shots/permissions.txt
           ls -l shots
+
+      - name: A real desktop session (window manager, tray, notification daemon)
+        env:
+          APPIMAGE_FILE: ${{ steps.pack.outputs.appimage }}
+        run: |
+          set -euo pipefail
+          # A copy of the seeded data whose reminder time has already passed today, so the app's
+          # own scheduler sends the daily reminder within its one minute poll.
+          cp -a data-seeded data-session
+          python3 - data-session <<'PY'
+          import json, os, sys
+          d = sys.argv[1]
+          for name in os.listdir(d):
+              if name.endswith(".json") and "app-state" in name:
+                  p = os.path.join(d, name); m = json.load(open(p))
+                  def walk(o):
+                      if isinstance(o, dict):
+                          if "dailyReminderTime" in o: o["dailyReminderTime"] = "00:01"; o["notificationsEnabled"] = True
+                          for v in o.values(): walk(v)
+                      elif isinstance(o, list):
+                          for v in o: walk(v)
+                  walk(m); json.dump(m, open(p, "w")); print("reminder set in", name)
+          PY
+          export REVEAL_DESKTOP_DATA_DIR="$PWD/data-session" APPIMAGE_EXTRACT_AND_RUN=1
+          Xvfb :77 -screen 0 1600x1000x24 & sleep 2
+          export DISPLAY=:77
+          dbus-run-session -- bash -euo pipefail -c '
+            openbox & sleep 2
+            stalonetray --geometry 4x1+1400+0 --icon-size 32 -bg "#333333" & sleep 1
+            dunst -print > shots/notifications.log 2>&1 & sleep 1
+            "$APPIMAGE_FILE" > shots/session.log 2>&1 &
+            pid=$!
+            sleep 40
+            kill -0 $pid
+            # An ordinary window opened over the mini window, which must stay on top.
+            xterm -geometry 200x60+0+0 -bg "#552222" & sleep 3
+            for w in $(xdotool search --onlyvisible --name "." 2>/dev/null); do
+              echo "$w $(xprop -id $w WM_NAME _NET_WM_STATE 2>/dev/null | paste -sd" " -)"
+            done | tee shots/windows.txt
+            import -window root shots/session.png
+            # The tray icon: clicking it must open the tray menu.
+            xdotool mousemove 1416 16 click 3; sleep 2
+            import -window root shots/tray-menu.png
+            sleep 50
+            import -window root shots/after-reminder.png
+            kill $pid || true
+          '
+          cat shots/notifications.log
+          grep -q "Reveal the Dream" shots/notifications.log || { echo "no notification reached the daemon"; exit 1; }
+          grep -q "_NET_WM_STATE_ABOVE" shots/windows.txt || { echo "no window asked to stay on top"; exit 1; }
+
+      - name: The in-app update replaces the AppImage and relaunches it
+        if: ${{ inputs.update_run != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPIMAGE_FILE: ${{ steps.pack.outputs.appimage }}
+          UPDATE_SIG: ${{ inputs.update_sig }}
+        run: |
+          set -euo pipefail
+          gh run download "${{ inputs.update_run }}" --repo "$GITHUB_REPOSITORY" --pattern 'revealthedream-linux-[0-9]*' --dir newer
+          new=$(find "$PWD/newer" -name '*.AppImage' | head -1)
+          sha=$(sha256sum "$new" | cut -d' ' -f1)
+          mkdir -p "$HOME/Apps" && cp "$APPIMAGE_FILE" "$HOME/Apps/RevealTheDream.AppImage" && chmod +x "$HOME/Apps/RevealTheDream.AppImage"
+          mk() { printf '{"linuxVersion":"9.9.9","linuxUrl":"https://example.com/x.AppImage","linuxSha256":"%s","linuxSizeBytes":%s,"linuxSig":"%s"}' "$sha" "$(stat -c%s "$new")" "$1" > "$2"; }
+          mk "$UPDATE_SIG" good.json
+          mk "$(echo "$UPDATE_SIG" | rev)" bad.json
+          export REVEAL_DESKTOP_DATA_DIR="$PWD/data-update" APPIMAGE_EXTRACT_AND_RUN=1
+          Xvfb :78 -screen 0 1600x1000x24 & sleep 2
+          export DISPLAY=:78
+          # A bad signature first: refused, file untouched.
+          (cd android && ./gradlew :desktop:run --no-daemon --console=plain -q \
+            "--args=--verify update-selftest-linux $PWD/../bad.json $HOME/Apps/RevealTheDream.AppImage $new --negative" | grep VERIFY_)
+          (cd android && ./gradlew :desktop:run --no-daemon --console=plain -q \
+            "--args=--verify update-selftest-linux $PWD/../good.json $HOME/Apps/RevealTheDream.AppImage $new" | grep VERIFY_)
+          test "$(sha256sum "$HOME/Apps/RevealTheDream.AppImage" | cut -d' ' -f1)" = "$sha"
+          sleep 40
+          pgrep -af "RevealTheDream.AppImage|reveal-the-dream" | tee shots/relaunch.txt
+          grep -q . shots/relaunch.txt || { echo "the updated AppImage did not relaunch"; exit 1; }
+          import -window root shots/after-update.png
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
