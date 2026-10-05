@@ -22,7 +22,7 @@ modules:
     buildsystem: simple
     build-commands:
       - chmod +x RevealTheDream.AppImage
-      - ./RevealTheDream.AppImage --appimage-extract >/dev/null
+      - ./RevealTheDream.AppImage --appimage-extract >/dev/null && chmod -R a+rX squashfs-root
       - mkdir -p /app/lib/reveal-the-dream
       - cp -a squashfs-root/usr/. /app/lib/reveal-the-dream/
       - printf '#!/bin/sh\nexec /app/lib/reveal-the-dream/bin/reveal-the-dream "$@"\n' > reveal-the-dream.sh

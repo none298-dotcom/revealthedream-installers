@@ -18,7 +18,7 @@ jobs:
           f=$(ls dl/*.AppImage); chmod +x "$f"
           version=$(basename "$f" | sed 's/RevealTheDream-\(.*\)-x86_64.AppImage/\1/')
           echo "version=$version" >> "$GITHUB_ENV"
-          mkdir work && cd work && "../$f" --appimage-extract >/dev/null
+          mkdir work && cd work && "../$f" --appimage-extract >/dev/null && chmod -R a+rX squashfs-root
           test -x squashfs-root/usr/bin/reveal-the-dream
         env: { GH_TOKEN: "${{ github.token }}" }
       - name: Assemble the snap project
