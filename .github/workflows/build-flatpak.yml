@@ -7,7 +7,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Tools
         run: |
-          sudo apt-get update -q && sudo apt-get install -yq flatpak flatpak-builder xvfb imagemagick appstream >/dev/null
+          sudo apt-get update -q && sudo apt-get install -yq flatpak flatpak-builder xvfb imagemagick appstream ffmpeg xdotool openbox >/dev/null
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           flatpak install --user -y flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08 org.flatpak.Builder
       - name: Lint the manifest and metainfo
@@ -22,8 +22,16 @@ jobs:
           flatpak run --command=flatpak-builder-lint org.flatpak.Builder repo repo || true
       - name: Run and photograph it
         run: |
-          Xvfb :99 -screen 0 1440x900x24 & sleep 2
-          (DISPLAY=:99 dbus-run-session flatpak run com.revealthedream.RevealTheDream > run.log 2>&1 &); sleep 45
+          Xvfb :99 -screen 0 1280x800x24 & sleep 2
+          DISPLAY=:99 openbox & sleep 1
+          ffmpeg -loglevel error -f x11grab -video_size 1280x800 -framerate 24 -i :99 -t 75 -pix_fmt yuv420p flatpak-demo.mp4 &
+          (DISPLAY=:99 dbus-run-session flatpak run com.revealthedream.RevealTheDream > run.log 2>&1 &); sleep 40
+          for i in 1 2 3 4 5; do
+            w=$(DISPLAY=:99 xdotool search --name "Reveal the Dream" | head -1)
+            eval $(DISPLAY=:99 xdotool getwindowgeometry --shell $w)
+            DISPLAY=:99 xdotool mousemove $((X+WIDTH/2)) $((Y+HEIGHT*838/1000)) click 1; sleep 6
+          done
+          wait %3 || true
           DISPLAY=:99 import -window root flatpak-first-launch.png
           tail -20 run.log
           pgrep -f reveal-the-dream >/dev/null
@@ -31,4 +39,4 @@ jobs:
           ls -laR ~/.var/app/com.revealthedream.RevealTheDream | tail -25 || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
-        with: { name: flatpak, path: "flatpak-first-launch.png\nrun.log" }
+        with: { name: flatpak, path: "flatpak-first-launch.png\nflatpak-demo.mp4\nrun.log" }
