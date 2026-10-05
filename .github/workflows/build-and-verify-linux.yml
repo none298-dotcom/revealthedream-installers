@@ -64,8 +64,6 @@ jobs:
           echo "$APPIMAGETOOL_SHA256  appimagetool" | sha256sum -c -
           chmod +x appimagetool
 
-      # Reported, never blocking the build: until a translation pass lands, new English strings
-      # fail LocalizationCompletenessTest by design. Read this step's result on every run.
       - name: Desktop tests
         working-directory: android
         run: |
