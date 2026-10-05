@@ -68,7 +68,6 @@ jobs:
       # fail LocalizationCompletenessTest by design. Read this step's result on every run.
       - name: Desktop tests
         working-directory: android
-        continue-on-error: true
         run: |
           ./gradlew :desktop:test --no-daemon -q || {
             grep -h -o 'failure message="[^"]*' desktop/build/test-results/test/*.xml | cut -c1-400
