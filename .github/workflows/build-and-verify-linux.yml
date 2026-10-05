@@ -133,6 +133,16 @@ jobs:
           shoot settings "$seed" --open settings
           shoot journeys "$seed" --open journeys
 
+          # Full-height renders of the screens whose wording differs on Linux (the countdown note,
+          # the backup card, the Premium sync line), drawn by the verify harness on THIS OS.
+          for action in render-screens premium-screens backup-screens; do
+            (cd android && REVEAL_DESKTOP_DATA_DIR="$seed" xvfb-run -a ./gradlew :desktop:run --no-daemon --console=plain -q \
+              "--args=--verify $action" 2>&1 | grep VERIFY_ || true)
+          done
+          mkdir -p shots/renders
+          find android/desktop/screenshot -name '*.png' -newer seed-args.txt -exec cp {} shots/renders/ \; || true
+          ls shots/renders
+
           # The data the app wrote must be owner-only, as on the other platforms.
           stat -c '%a %n' "$seed" "$seed"/* | tee shots/permissions.txt
           ls -l shots
