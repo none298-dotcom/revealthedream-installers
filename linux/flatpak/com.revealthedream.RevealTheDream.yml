@@ -1,0 +1,42 @@
+app-id: com.revealthedream.RevealTheDream
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+command: reveal-the-dream
+separate-locales: false
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=x11
+  - --device=dri
+  - --talk-name=org.freedesktop.Notifications
+modules:
+  - name: libnotify
+    buildsystem: meson
+    config-opts: [-Dtests=false, -Dintrospection=disabled, -Dgtk_doc=false, -Dman=false, -Ddocbook_docs=disabled]
+    sources:
+      - type: archive
+        url: https://download.gnome.org/sources/libnotify/0.8/libnotify-0.8.3.tar.xz
+        sha256: ee8f3ef946156ad3406fdf45feedbdcd932dbd211ab4f16f75eba4f36fb2f6c0
+  - name: reveal-the-dream
+    buildsystem: simple
+    build-commands:
+      - chmod +x RevealTheDream.AppImage
+      - ./RevealTheDream.AppImage --appimage-extract >/dev/null
+      - mkdir -p /app/lib/reveal-the-dream
+      - cp -a squashfs-root/usr/. /app/lib/reveal-the-dream/
+      - printf '#!/bin/sh\nexec /app/lib/reveal-the-dream/bin/reveal-the-dream "$@"\n' > reveal-the-dream.sh
+      - install -Dm755 reveal-the-dream.sh /app/bin/reveal-the-dream
+      - install -Dm644 squashfs-root/reveal-the-dream.png /app/share/icons/hicolor/512x512/apps/com.revealthedream.RevealTheDream.png
+      - install -Dm644 com.revealthedream.RevealTheDream.desktop -t /app/share/applications
+      - install -Dm644 com.revealthedream.RevealTheDream.metainfo.xml -t /app/share/metainfo
+    sources:
+      - type: file
+        url: https://github.com/none298-dotcom/revealthedream-installers/releases/download/linux-1.8.0/RevealTheDream-1.8.0-x86_64.AppImage
+        sha256: fe3c2ba6095cb1db22466daf8d363b290247969cd4169c17bc13c8641e8300a9
+        dest-filename: RevealTheDream.AppImage
+        only-arches: [x86_64]
+      - type: file
+        path: com.revealthedream.RevealTheDream.desktop
+      - type: file
+        path: com.revealthedream.RevealTheDream.metainfo.xml

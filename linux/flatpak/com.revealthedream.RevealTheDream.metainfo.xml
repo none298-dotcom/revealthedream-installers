@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.revealthedream.RevealTheDream</id>
+  <name>Reveal the Dream</name>
+  <summary>Uncover a photo of your goal, one check-in at a time</summary>
+  <developer id="com.revealthedream"><name>Lee</name></developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary=https://revealthedream.com/terms</project_license>
+  <description>
+    <p>Pick a photo of a goal you are working toward. It starts covered, divided into one piece per day of your journey. Each daily check-in uncovers one more piece, until the whole photo shows.</p>
+    <p>Miss a day and nothing resets. That day's piece stays covered and the next days keep opening.</p>
+    <p>On Linux you get a mini window that stays above your other windows and a daily reminder in your desktop's notifications. Free to use. Premium adds sync with iPhone, Mac, Windows and Android, several journeys at once, rest days and App Lock.</p>
+  </description>
+  <launchable type="desktop-id">com.revealthedream.RevealTheDream.desktop</launchable>
+  <url type="homepage">https://revealthedream.com/habit-tracker-for-linux</url>
+  <url type="contact">https://revealthedream.com/contact</url>
+  <url type="help">https://revealthedream.com/support</url>
+  <categories><category>Utility</category></categories>
+  <branding>
+    <color type="primary" scheme_preference="light">#f6f1e7</color>
+    <color type="primary" scheme_preference="dark">#4f7866</color>
+  </branding>
+  <screenshots>
+    <screenshot type="default"><caption>A journey part way through</caption><image>https://raw.githubusercontent.com/none298-dotcom/revealthedream-installers/main/linux/flatpak/screenshots/reveal.png</image></screenshot>
+    <screenshot><caption>Reveal styles in Settings</caption><image>https://raw.githubusercontent.com/none298-dotcom/revealthedream-installers/main/linux/flatpak/screenshots/settings.png</image></screenshot>
+    <screenshot><caption>Your journeys</caption><image>https://raw.githubusercontent.com/none298-dotcom/revealthedream-installers/main/linux/flatpak/screenshots/journeys.png</image></screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="1.8.0" date="2026-10-05"><description><p>First Linux release, with a short tour, the mini window, daily reminders and Premium Lifetime.</p></description></release>
+  </releases>
+</component>

@@ -1,0 +1,32 @@
+name: Build and lint the Flatpak
+on: workflow_dispatch
+jobs:
+  flatpak:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Tools
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq flatpak flatpak-builder xvfb imagemagick appstream >/dev/null
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08 org.flatpak.Builder
+      - name: Lint the manifest and metainfo
+        working-directory: linux/flatpak
+        run: |
+          flatpak run --command=flatpak-builder-lint org.flatpak.Builder manifest com.revealthedream.RevealTheDream.yml || true
+          flatpak run --command=flatpak-builder-lint org.flatpak.Builder appstream com.revealthedream.RevealTheDream.metainfo.xml
+      - name: Build and install
+        working-directory: linux/flatpak
+        run: |
+          flatpak run org.flatpak.Builder --user --install --force-clean --repo=repo build com.revealthedream.RevealTheDream.yml
+          flatpak run --command=flatpak-builder-lint org.flatpak.Builder repo repo || true
+      - name: Run and photograph it
+        run: |
+          Xvfb :99 -screen 0 1440x900x24 & sleep 2
+          (DISPLAY=:99 flatpak run com.revealthedream.RevealTheDream > run.log 2>&1 &); sleep 45
+          DISPLAY=:99 import -window root flatpak-first-launch.png
+          tail -20 run.log
+          pgrep -f reveal-the-dream >/dev/null
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with: { name: flatpak, path: "flatpak-first-launch.png\nrun.log" }
