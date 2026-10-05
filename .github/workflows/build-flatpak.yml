@@ -18,7 +18,7 @@ jobs:
       - name: Build and install
         working-directory: linux/flatpak
         run: |
-          flatpak run org.flatpak.Builder --user --install --force-clean --repo=repo build com.revealthedream.RevealTheDream.yml
+          flatpak run org.flatpak.Builder --user --install-deps-from=flathub --install --force-clean --repo=repo build com.revealthedream.RevealTheDream.yml
           flatpak run --command=flatpak-builder-lint org.flatpak.Builder repo repo || true
       - name: Run and photograph it
         run: |
