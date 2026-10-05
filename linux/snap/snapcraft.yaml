@@ -1,0 +1,35 @@
+name: revealthedream
+title: Reveal the Dream
+base: core22
+version: '__VERSION__'
+summary: Uncover a photo of your goal, one daily check-in at a time
+description: |
+  Pick a photo of a goal you are working toward. It starts covered, divided into one piece per
+  day of your journey. Each daily check-in uncovers one more piece, until the whole photo shows.
+
+  Miss a day and nothing resets. That day's piece stays covered and the next days keep opening.
+
+  On Linux you get a mini window that stays above your other windows, a daily reminder in your
+  desktop's notifications, and a tray icon where your desktop has a tray. Free to use. Premium adds
+  sync with iPhone, Mac, Windows and Android, several journeys at once, rest days and App Lock.
+website: https://revealthedream.com/habit-tracker-for-linux
+contact: https://revealthedream.com/contact
+license: Proprietary
+icon: snap/gui/reveal-the-dream.png
+grade: stable
+confinement: strict
+architectures: [amd64]
+
+apps:
+  revealthedream:
+    command: usr/bin/reveal-the-dream
+    desktop: snap/gui/reveal-the-dream.desktop
+    extensions: [gnome]
+    plugs: [network, home, desktop, desktop-legacy, x11, wayland, unity7, opengl]
+
+parts:
+  app:
+    plugin: dump
+    source: squashfs-root
+    stage: [usr]
+    stage-packages: [libnotify-bin, libxtst6, libxi6, libxrender1, libxext6, libfontconfig1, libfreetype6]

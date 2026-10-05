@@ -1,0 +1,55 @@
+name: Build and publish the Snap
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Upload to the Snap Store stable channel"
+        type: boolean
+        default: false
+jobs:
+  snap:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Get the published AppImage
+        run: |
+          set -euo pipefail
+          gh release download latest --repo "$GITHUB_REPOSITORY" --pattern 'RevealTheDream-*-x86_64.AppImage' --dir dl
+          f=$(ls dl/*.AppImage); chmod +x "$f"
+          version=$(basename "$f" | sed 's/RevealTheDream-\(.*\)-x86_64.AppImage/\1/')
+          echo "version=$version" >> "$GITHUB_ENV"
+          mkdir work && cd work && "../$f" --appimage-extract >/dev/null
+          test -x squashfs-root/usr/bin/reveal-the-dream
+        env: { GH_TOKEN: "${{ github.token }}" }
+      - name: Assemble the snap project
+        run: |
+          set -euo pipefail
+          cp -r linux/snap work/snap
+          mkdir -p work/snap/gui
+          cp linux/reveal-the-dream.desktop work/snap/gui/
+          sed -i 's#^Icon=.*#Icon=${SNAP}/snap/gui/reveal-the-dream.png#' work/snap/gui/reveal-the-dream.desktop
+          cp work/squashfs-root/reveal-the-dream.png work/snap/gui/
+          sed -i "s/__VERSION__/$version/" work/snap/snapcraft.yaml
+      - name: Build
+        run: |
+          set -euo pipefail
+          sudo snap install snapcraft --classic
+          cd work && sudo snapcraft --destructive-mode
+          ls -l *.snap
+      - name: Install it and photograph it on a virtual screen
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q && sudo apt-get install -yq xvfb imagemagick >/dev/null
+          sudo snap install --dangerous work/*.snap
+          Xvfb :99 -screen 0 1440x900x24 & sleep 2
+          (DISPLAY=:99 revealthedream > run.log 2>&1 &) ; sleep 40
+          DISPLAY=:99 import -window root snap-first-launch.png
+          pgrep -f reveal-the-dream >/dev/null || { cat run.log; exit 1; }
+          cat run.log | tail -20
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with: { name: snap, path: "work/*.snap\nsnap-first-launch.png\nrun.log" }
+      - name: Upload to the Snap Store
+        if: ${{ inputs.release }}
+        env: { SNAPCRAFT_STORE_CREDENTIALS: "${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}" }
+        run: snapcraft upload --release=stable work/*.snap
