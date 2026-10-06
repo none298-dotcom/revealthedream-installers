@@ -52,6 +52,10 @@ on:
         description: "Private repo ref to render the widget card from"
         default: "main"
         required: true
+      dayByDay:
+        description: "Render the selected journey as Day by day (365 earlier days)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -141,6 +145,8 @@ jobs:
             countdownLine = "Opens 9:00 PM $middot in 4h 12m"
             startDateText = "Started Sep 16"
           }
+          # Day by day reads "Day 412" with no total (RevealWidgetProvider's dayText).
+          if ("${{ inputs.dayByDay }}" -eq "true") { $journeyLong.dayByDayEarlierDays = 365 }
           $journeyLong | ConvertTo-Json | Set-Content -Path (Join-Path $dir "widget-journey-$longId.json") -Encoding UTF8
 
           # The second catalog entry needs its own payload too, or it hits CardData's
