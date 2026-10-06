@@ -56,6 +56,10 @@ on:
         description: "Render the selected journey as Day by day (365 earlier days)"
         type: boolean
         default: false
+      locale:
+        description: "Widget language written to widget-locale.txt (blank = English)"
+        default: ""
+        required: false
 
 permissions:
   contents: read
@@ -176,6 +180,9 @@ jobs:
             $bmp.Dispose()
           }
 
+          if ("${{ inputs.locale }}" -ne "") {
+            Set-Content -Path (Join-Path $dir "widget-locale.txt") -Value "${{ inputs.locale }}" -Encoding UTF8 -NoNewline
+          }
           Write-Host "Fixture written to $dir"
           Get-ChildItem $dir | ForEach-Object { Write-Host "  $($_.Name)  $($_.Length) bytes" }
 
