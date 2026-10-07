@@ -155,6 +155,14 @@ jobs:
           shutil.copy(photo, group / image)
           print(lang, scenario, summary)
           PY
+              # The app shows its first-run tour to anyone without Premium until the tour is marked
+              # seen, so every scenario but "fresh" marks it, in the sandbox container's own prefs.
+              PREFS="$HOME/Library/Containers/com.revealthedream.app/Data/Library/Preferences/com.revealthedream.app"
+              if [ "$S" = "fresh" ]; then
+                defaults delete "$PREFS" com.revealthedream.tour.completedAt 2>/dev/null || true
+              else
+                defaults write "$PREFS" com.revealthedream.tour.completedAt -date "2026-01-01 00:00:00 +0000"
+              fi
               open -n "$APP" --args -AppleLanguages "($L)" -AppleLocale "$LOCALE"
               sleep 12
               osascript -e 'tell application "System Events" to tell process "Reveal the Dream" to set position of front window to {0, 25}' \
