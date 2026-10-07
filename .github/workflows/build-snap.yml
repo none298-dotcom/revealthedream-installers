@@ -15,7 +15,7 @@ jobs:
         run: |
           set -euo pipefail
           gh release download latest --repo "$GITHUB_REPOSITORY" --pattern 'RevealTheDream-*-x86_64.AppImage' --dir dl
-          f=$(ls dl/*.AppImage); chmod +x "$f"
+          f=$(ls dl/*.AppImage | sort -V | tail -1); chmod +x "$f"
           version=$(basename "$f" | sed 's/RevealTheDream-\(.*\)-x86_64.AppImage/\1/')
           echo "version=$version" >> "$GITHUB_ENV"
           mkdir work && cd work && "../$f" --appimage-extract >/dev/null && chmod -R a+rX squashfs-root
