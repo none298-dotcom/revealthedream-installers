@@ -52,6 +52,8 @@ jobs:
           gnome-shell --headless --unsafe-mode --virtual-monitor 1600x1000 --wayland > shots/gnome-shell.log 2>&1 &
           sleep 20
           export WAYLAND_DISPLAY=wayland-0
+          # What a logged-in Ubuntu GNOME session sets; the tray library reads it to pick AppIndicator.
+          export XDG_CURRENT_DESKTOP=ubuntu:GNOME XDG_SESSION_DESKTOP=ubuntu DESKTOP_SESSION=ubuntu
           export DISPLAY=$(ls /tmp/.X11-unix 2>/dev/null | head -1 | sed 's/^X/:/')
           # Headless mutter guards Xwayland with its own cookie; AWT needs it to connect.
           export XAUTHORITY=$(ls "$XDG_RUNTIME_DIR"/.mutter-Xwaylandauth.* 2>/dev/null | head -1)
