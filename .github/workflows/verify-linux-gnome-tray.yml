@@ -1,0 +1,73 @@
+name: Verify the Linux tray on GNOME (AppIndicator)
+
+# The desktop app's Linux tray goes through AppIndicator (dorkbox SystemTray, pinned in the private
+# repo's android/desktop/build.gradle.kts), because GNOME has no XEmbed tray for AWT to use. This
+# proves it on a real GNOME Shell with the AppIndicator extension: the library must report
+# "AppIndicator", the running app must register a StatusNotifierItem, and the top bar is
+# photographed. Never publishes anything.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Private repo branch, tag or SHA"
+        default: "main"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  gnome-tray:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the PRIVATE source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: none298-dotcom/revealthedream
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: GNOME Shell with the AppIndicator extension
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gnome-shell gnome-shell-extension-appindicator dbus-x11 libnotify-bin
+
+      - name: Build the desktop app
+        run: cd android && ./gradlew :desktop:compileKotlin --no-daemon -q
+
+      - name: Headless GNOME, the tray type, the registered item, and a picture of the top bar
+        run: |
+          mkdir -p shots
+          export XDG_RUNTIME_DIR=$(mktemp -d); chmod 700 "$XDG_RUNTIME_DIR"
+          eval "$(dbus-launch --sh-syntax)"
+          gsettings set org.gnome.shell disable-user-extensions false
+          gsettings set org.gnome.shell enabled-extensions "['ubuntu-appindicators@ubuntu.com']"
+          gnome-shell --headless --unsafe-mode --virtual-monitor 1600x1000 --wayland > shots/gnome-shell.log 2>&1 &
+          sleep 20
+          export WAYLAND_DISPLAY=wayland-0
+          export DISPLAY=$(ls /tmp/.X11-unix 2>/dev/null | head -1 | sed 's/^X/:/')
+          echo "DISPLAY=$DISPLAY"
+          gnome-extensions list --enabled | tee shots/extensions.txt || true
+          (cd android && ./gradlew :desktop:run --no-daemon -q --args="--verify tray-type") 2>&1 | tee shots/tray-type.txt
+          (cd android && ./gradlew :desktop:run --no-daemon -q > ../shots/app.log 2>&1) &
+          sleep 60
+          gdbus call --session --dest org.kde.StatusNotifierWatcher --object-path /StatusNotifierWatcher \
+            --method org.freedesktop.DBus.Properties.Get org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems \
+            | tee shots/items.txt || true
+          gdbus call --session --dest org.gnome.Shell.Screenshot --object-path /org/gnome/Shell/Screenshot \
+            --method org.gnome.Shell.Screenshot.Screenshot false false "$PWD/shots/gnome-top-bar.png" || true
+          grep -q "VERIFY_TRAY_TYPE:AppIndicator" shots/tray-type.txt
+          grep -q "/" shots/items.txt
+
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gnome-tray
+          path: shots
