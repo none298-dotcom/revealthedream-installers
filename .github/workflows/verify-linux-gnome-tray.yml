@@ -53,8 +53,13 @@ jobs:
           sleep 20
           export WAYLAND_DISPLAY=wayland-0
           export DISPLAY=$(ls /tmp/.X11-unix 2>/dev/null | head -1 | sed 's/^X/:/')
-          echo "DISPLAY=$DISPLAY"
+          # Headless mutter guards Xwayland with its own cookie; AWT needs it to connect.
+          export XAUTHORITY=$(ls "$XDG_RUNTIME_DIR"/.mutter-Xwaylandauth.* 2>/dev/null | head -1)
+          echo "DISPLAY=$DISPLAY XAUTHORITY=$XAUTHORITY"
+          gnome-extensions enable ubuntu-appindicators@ubuntu.com || true
+          sleep 5
           gnome-extensions list --enabled | tee shots/extensions.txt || true
+          gdbus introspect --session --dest org.kde.StatusNotifierWatcher --object-path /StatusNotifierWatcher > shots/watcher.txt 2>&1 || true
           (cd android && ./gradlew :desktop:run --no-daemon -q --args="--verify tray-type") 2>&1 | tee shots/tray-type.txt
           (cd android && ./gradlew :desktop:run --no-daemon -q > ../shots/app.log 2>&1) &
           sleep 60
