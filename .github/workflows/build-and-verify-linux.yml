@@ -137,7 +137,6 @@ jobs:
           printf '%s' "$(basename "$APPIMAGE_FILE" | sed 's/RevealTheDream-\(.*\)-x86_64.AppImage/\1/')" > "$seed/whats-new-last-seen"
           cp -a "$seed" data-session-src   # before the renders below write their own journeys here
           shoot reveal "$seed"
-          shoot settings "$seed" --open settings
           shoot journeys "$seed" --open journeys
 
           # Full-height renders of the screens whose wording differs on Linux (the countdown note,
@@ -150,6 +149,19 @@ jobs:
           find android/desktop/screenshot -name '*.png' -newer seed-args.txt -exec cp {} shots/renders/ \; || true
           ls shots/renders
           test -f shots/renders/premium-full-list.png
+
+          # P6 store shots (2026-10-19): the Premium scenes the live app cannot show on a runner with
+          # no account. stage.py writes the three-journey showcase every platform uses; the dev-only
+          # seed-showcase loads it as Premium, render-showcase draws the shipped screens at 2x.
+          # Never Settings. Neither action exists in the AppImage (VerifyHarnessAbsentTest).
+          python3 tools/store-shots/stage.py --emit-showcase en "$PWD/showcase" Drink
+          (cd android && REVEAL_DESKTOP_DATA_DIR="$PWD/../data-showcase" xvfb-run -a ./gradlew :desktop:run --no-daemon --console=plain -q \
+            "--args=--verify seed-showcase $PWD/../showcase" 2>&1 | tee ../shots/showcase-seed.log | grep VERIFY_)
+          grep -q 'VERIFY_SEED_SHOWCASE:.*premium=premium' shots/showcase-seed.log
+          (cd android && REVEAL_DESKTOP_DATA_DIR="$PWD/../data-showcase" xvfb-run -a ./gradlew :desktop:run --no-daemon --console=plain -q \
+            "--args=--verify render-showcase" 2>&1 | tee ../shots/showcase-render.log | grep VERIFY_)
+          test "$(grep -c 'VERIFY_RENDER_SHOWCASE:.* OK' shots/showcase-render.log)" -ge 5
+          mkdir -p shots/showcase && cp android/desktop/screenshot/showcase-*.png shots/showcase/
 
           # The data the app wrote must be owner-only, as on the other platforms.
           stat -c '%a %n' "$seed" "$seed"/* | tee shots/permissions.txt

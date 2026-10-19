@@ -1232,7 +1232,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: microsoft-store-screenshots
-          path: ${{ runner.temp }}/store-screenshots/*.png
+          path: |
+            ${{ runner.temp }}/store-screenshots/*.png
+            ${{ runner.temp }}/store-screenshots/showcase/*.png
           if-no-files-found: error
 
       - name: Upload the store screenshots in other languages
