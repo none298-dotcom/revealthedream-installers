@@ -15,6 +15,10 @@ name: Build and verify the Linux AppImage
 on:
   workflow_dispatch:
     inputs:
+      showcase_languages:
+        description: "Languages for the Premium showcase store scenes (space separated ids)"
+        default: "en"
+        type: string
       ref:
         description: "Private repo branch, tag or SHA to build"
         default: "main"
@@ -110,6 +114,7 @@ jobs:
       - name: Run it on a virtual screen and photograph it
         env:
           APPIMAGE_FILE: ${{ steps.pack.outputs.appimage }}
+          SHOWCASE_LANGUAGES: ${{ inputs.showcase_languages }}
         run: |
           set -euo pipefail
           mkdir -p shots
@@ -154,14 +159,21 @@ jobs:
           # no account. stage.py writes the three-journey showcase every platform uses; the dev-only
           # seed-showcase loads it as Premium, render-showcase draws the shipped screens at 2x.
           # Never Settings. Neither action exists in the AppImage (VerifyHarnessAbsentTest).
-          python3 tools/store-shots/stage.py --emit-showcase en "$PWD/showcase" Drink
-          (cd android && REVEAL_DESKTOP_DATA_DIR="$PWD/../data-showcase" xvfb-run -a ./gradlew :desktop:run --no-daemon --console=plain -q \
-            "--args=--verify seed-showcase $PWD/../showcase" 2>&1 | tee ../shots/showcase-seed.log | grep VERIFY_)
-          grep -q 'VERIFY_SEED_SHOWCASE:.*premium=premium' shots/showcase-seed.log
-          (cd android && REVEAL_DESKTOP_DATA_DIR="$PWD/../data-showcase" xvfb-run -a ./gradlew :desktop:run --no-daemon --console=plain -q \
-            "--args=--verify render-showcase" 2>&1 | tee ../shots/showcase-render.log | grep VERIFY_)
-          test "$(grep -c 'VERIFY_RENDER_SHOWCASE:.* OK' shots/showcase-render.log)" -ge 5
-          mkdir -p shots/showcase && cp android/desktop/screenshot/showcase-*.png shots/showcase/
+          mkdir -p shots/showcase
+          for L in ${SHOWCASE_LANGUAGES:-en}; do
+            python3 tools/store-shots/stage.py --emit-showcase "$L" "$PWD/showcase-$L" x
+            rm -rf "$PWD/data-showcase-$L"
+            export RTD_VERIFY_LANG=$([ "$L" = en ] && echo device || echo "$L")
+            (cd android && REVEAL_DESKTOP_DATA_DIR="$PWD/../data-showcase-$L" xvfb-run -a ./gradlew :desktop:run --no-daemon --console=plain -q \
+              "--args=--verify seed-showcase $PWD/../showcase-$L" 2>&1 | tee ../shots/showcase-seed-$L.log | grep VERIFY_)
+            grep -q 'VERIFY_SEED_SHOWCASE:.*premium=premium' shots/showcase-seed-$L.log
+            (cd android && REVEAL_DESKTOP_DATA_DIR="$PWD/../data-showcase-$L" xvfb-run -a ./gradlew :desktop:run --no-daemon --console=plain -q \
+              "--args=--verify render-showcase" 2>&1 | tee ../shots/showcase-render-$L.log | grep VERIFY_)
+            test "$(grep -c 'VERIFY_RENDER_SHOWCASE:.* OK' shots/showcase-render-$L.log)" -ge 5
+            mkdir -p shots/showcase/$L && cp android/desktop/screenshot/showcase-*.png shots/showcase/$L/
+            rm -f android/desktop/screenshot/showcase-*.png
+          done
+          unset RTD_VERIFY_LANG
 
           # The data the app wrote must be owner-only, as on the other platforms.
           stat -c '%a %n' "$seed" "$seed"/* | tee shots/permissions.txt
