@@ -111,6 +111,14 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "appimage=$out" >> "$GITHUB_OUTPUT"
 
+      # The runner has no CJK font, so Japanese, Chinese and Korean drew as empty boxes in the store
+      # scenes. A customer's Linux desktop has them; the photograph of the runner needs the same.
+      - name: Fonts for the store scenes (CJK, Indic, Thai, Arabic, Hebrew)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji
+          fc-list | grep -ci "noto sans cjk" || true
+
       - name: Run it on a virtual screen and photograph it
         env:
           APPIMAGE_FILE: ${{ steps.pack.outputs.appimage }}
