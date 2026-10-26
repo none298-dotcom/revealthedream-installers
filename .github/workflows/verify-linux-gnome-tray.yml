@@ -71,8 +71,18 @@ jobs:
             | tee shots/items.txt || true
           gdbus call --session --dest org.gnome.Shell.Screenshot --object-path /org/gnome/Shell/Screenshot \
             --method org.gnome.Shell.Screenshot.Screenshot false false "$PWD/shots/gnome-top-bar.png" || true
+          # THE MENU ITSELF (owner 2026-10-26): ask the registered item for its dbusmenu layout, which
+          # is the list of rows the indicator will draw, and keep it as text.
+          ITEM=$(grep -oE "[^' ]+/[^' ]+" shots/items.txt | head -1)
+          BUS="${ITEM%%/*}"; OBJ="/${ITEM#*/}"
+          echo "item=$ITEM bus=$BUS path=$OBJ" | tee shots/menu-layout.txt
+          MENU=$(gdbus call --session --dest "$BUS" --object-path "$OBJ" --method org.freedesktop.DBus.Properties.Get org.kde.StatusNotifierItem Menu 2>&1 | grep -oE "/[A-Za-z0-9_/]+" | head -1)
+          echo "menu path=$MENU" | tee -a shots/menu-layout.txt
+          gdbus call --session --dest "$BUS" --object-path "$MENU" --method com.canonical.dbusmenu.GetLayout 0 -1 "[]" 2>&1 | tee -a shots/menu-layout.txt || true
           grep -q "VERIFY_TRAY_TYPE:AppIndicator" shots/tray-type.txt
           grep -q "/" shots/items.txt
+          grep -q "Upgrade to Premium" shots/menu-layout.txt
+          grep -q "New Journey" shots/menu-layout.txt
 
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
