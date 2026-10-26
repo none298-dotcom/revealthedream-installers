@@ -73,12 +73,15 @@ jobs:
             --method org.gnome.Shell.Screenshot.Screenshot false false "$PWD/shots/gnome-top-bar.png" || true
           # THE MENU ITSELF (owner 2026-10-26): ask the registered item for its dbusmenu layout, which
           # is the list of rows the indicator will draw, and keep it as text.
-          ITEM=$(grep -oE "[^' ]+/[^' ]+" shots/items.txt | head -1)
-          BUS="${ITEM%%/*}"; OBJ="/${ITEM#*/}"
+          # The registered item reads "<bus name>@<object path>".
+          ITEM=$(grep -oE "[^' ]+@/[^' ]+" shots/items.txt | head -1)
+          BUS="${ITEM%%@*}"; OBJ="${ITEM#*@}"
           echo "item=$ITEM bus=$BUS path=$OBJ" | tee shots/menu-layout.txt
-          MENU=$(gdbus call --session --dest "$BUS" --object-path "$OBJ" --method org.freedesktop.DBus.Properties.Get org.kde.StatusNotifierItem Menu 2>&1 | grep -oE "/[A-Za-z0-9_/]+" | head -1)
-          echo "menu path=$MENU" | tee -a shots/menu-layout.txt
-          gdbus call --session --dest "$BUS" --object-path "$MENU" --method com.canonical.dbusmenu.GetLayout 0 -1 "[]" 2>&1 | tee -a shots/menu-layout.txt || true
+          gdbus introspect --session --dest "$BUS" --object-path / --recurse > shots/item-introspect.txt 2>&1 || true
+          for CAND in "$OBJ/Menu" "$OBJ/menu" "/MenuBar" "/org/ayatana/NotificationItem/Menu"; do
+            OUT=$(gdbus call --session --dest "$BUS" --object-path "$CAND" --method com.canonical.dbusmenu.GetLayout 0 -1 "[]" 2>&1) || true
+            if echo "$OUT" | grep -q "Reveal\|Upgrade\|Quit"; then echo "menu path=$CAND" | tee -a shots/menu-layout.txt; echo "$OUT" | tee -a shots/menu-layout.txt; break; fi
+          done
           grep -q "VERIFY_TRAY_TYPE:AppIndicator" shots/tray-type.txt
           grep -q "/" shots/items.txt
           grep -q "Upgrade to Premium" shots/menu-layout.txt
