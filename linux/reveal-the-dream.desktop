@@ -6,5 +6,6 @@ Comment=Uncover a photo of your goal, one daily check-in at a time
 Exec=reveal-the-dream
 Icon=reveal-the-dream
 Terminal=false
+StartupWMClass=reveal-the-dream
 Categories=Utility;
 Keywords=goal;habit;streak;photo;journey;
