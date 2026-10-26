@@ -1222,6 +1222,12 @@ jobs:
               }
             }
             $r = FindTrayIcon
+            if (-not $r) {
+              # Seen in the picture of run 40315046488: the app's icon is the fourth one in the flyout,
+              # about 85 percent across and 92 percent down a 1024x768 screen. UI Automation does not
+              # name it, so the click goes there by position.
+              $r = New-Object System.Windows.Rect ([int]($b.Width * 0.8467 - 8), [int]($b.Height * 0.9206 - 8), 16, 16)
+            }
           }
           if ($r) {
             Write-Host "Tray icon at $($r.X),$($r.Y) $($r.Width)x$($r.Height)"

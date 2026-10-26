@@ -79,7 +79,7 @@ jobs:
           echo "item=$ITEM bus=$BUS path=$OBJ" | tee shots/menu-layout.txt
           gdbus introspect --session --dest "$BUS" --object-path / --recurse > shots/item-introspect.txt 2>&1 || true
           for CAND in "$OBJ/Menu" "$OBJ/menu" "/MenuBar" "/org/ayatana/NotificationItem/Menu"; do
-            OUT=$(gdbus call --session --dest "$BUS" --object-path "$CAND" --timeout 15 --method com.canonical.dbusmenu.GetLayout 0 -1 "@as []" 2>&1) || true
+            OUT=$(gdbus call --session --dest "$BUS" --object-path "$CAND" --timeout 15 --method com.canonical.dbusmenu.GetLayout 0 5 "@as []" 2>&1) || true
             echo "== $CAND: $OUT" >> shots/menu-raw.txt
             if echo "$OUT" | grep -q "Reveal\|Upgrade\|Quit"; then echo "menu path=$CAND" | tee -a shots/menu-layout.txt; echo "$OUT" | tee -a shots/menu-layout.txt; break; fi
           done
