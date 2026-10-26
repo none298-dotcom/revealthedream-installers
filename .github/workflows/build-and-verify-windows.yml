@@ -1206,19 +1206,21 @@ jobs:
           }
           $r = FindTrayIcon
           if (-not $r) {
-            # The icon may sit in the overflow flyout: open "Show hidden icons" and look again.
+            # The icon sits in the overflow flyout. Open it with the chevron, found by its place at the
+            # right of the taskbar (about 82 percent across), and list every button name to learn the label.
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $cx = [int]($b.Width * 0.825); $cy = [int]($b.Height - 20)
+            [void][M.N]::SetCursorPos($cx, $cy); Start-Sleep -Milliseconds 400
+            [M.N]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero); [M.N]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+            Start-Sleep -Seconds 3
+            Shot "$env:RUNNER_TEMP\\tray\\overflow.png"
             $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
             foreach ($e in $all) {
-              if ($e.Current.Name -like '*hidden icons*' -or $e.Current.Name -like '*Notification Chevron*') {
-                $c = $e.Current.BoundingRectangle
-                RightClickAt 0 0
-                [void][M.N]::SetCursorPos([int]($c.X + $c.Width/2), [int]($c.Y + $c.Height/2)); Start-Sleep -Milliseconds 300
-                [M.N]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero); [M.N]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
-                Start-Sleep -Seconds 2
-                break
+              if ($e.Current.ControlType.ProgrammaticName -eq 'ControlType.Button') {
+                $bb = $e.Current.BoundingRectangle
+                if ($bb.Y -gt 300 -and $bb.Width -gt 0) { Write-Host "BUTTON '$($e.Current.Name)' at $($bb.X),$($bb.Y)" }
               }
             }
-            Shot "$env:RUNNER_TEMP\tray\overflow.png"
             $r = FindTrayIcon
           }
           if ($r) {
