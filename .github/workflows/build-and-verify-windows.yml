@@ -1236,6 +1236,17 @@ jobs:
           } else { Write-Host "No tray icon found by name" }
           Shot "$env:RUNNER_TEMP\tray\tray-menu.png"
 
+      - name: Show the real tray menu from inside the app and photograph it
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        working-directory: android
+        run: |
+          # The app opens its OWN tray menu (the non-Premium one) and a screen capture is taken. A mouse
+          # click on the tray icon never produced a menu in four attempts, so this does not depend on one.
+          ./gradlew :desktop:run --console=plain --no-daemon `
+            "--args=--verify tray-popup $env:RUNNER_TEMP\tray"
+
       - name: Upload the tray menu picture
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
